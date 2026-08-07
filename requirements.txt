@@ -1,0 +1,8 @@
+numpy>=1.21
+Pillow>=9.0
+torch>=1.12
+torchvision>=0.13
+tqdm>=4.61
+opencv-python>=4.6
+pytest>=7.0
+# Optional dataset OCR stage: install easyocr separately after PyTorch is installed.

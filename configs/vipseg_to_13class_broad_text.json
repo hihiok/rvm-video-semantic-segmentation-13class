@@ -1,0 +1,23 @@
+{
+  "target_classes": [
+    {"id": 0, "name": "background", "source_names": []},
+    {"id": 1, "name": "sky", "source_names": ["sky"]},
+    {"id": 2, "name": "person", "source_names": ["person"]},
+    {"id": 3, "name": "plant", "source_names": ["grass", "tree", "other_plant"]},
+    {"id": 4, "name": "building", "source_names": ["building", "house", "bridge", "tower", "windmill", "other_construction"]},
+    {"id": 5, "name": "flower", "source_names": ["flower"]},
+    {"id": 6, "name": "food", "source_names": ["fruit", "food"]},
+    {"id": 7, "name": "water", "source_names": ["sea", "river", "lake", "waterfall", "water"]},
+    {"id": 8, "name": "desert", "source_names": ["sand"]},
+    {"id": 9, "name": "ice_or_snow", "source_names": ["ice", "snowfield"]},
+    {"id": 10, "name": "text", "source_names": ["billboard_or_Bulletin_Board", "painting_or_poster"]},
+    {"id": 11, "name": "ball", "source_names": ["ball"]},
+    {"id": 12, "name": "mountain", "source_names": ["mountain"]}
+  ],
+  "mapping_notes": {
+    "desert": "VIPSeg has sand but no desert class; sand is a proxy and includes beaches.",
+    "text": "Broad option: includes painting_or_poster, which may contain text-free paintings and should be filtered before production training.",
+    "ball": "Only the ball itself is used; ball_net and backboard are excluded.",
+    "void": "Source VOID is written as 255 and ignored during training."
+  }
+}
