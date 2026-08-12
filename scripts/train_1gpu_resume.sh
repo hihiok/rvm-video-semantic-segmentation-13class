@@ -6,6 +6,9 @@ set -euo pipefail
 # The previous crash was caused by system cuDNN being injected through
 # LD_LIBRARY_PATH. PyTorch 2.3.0 must use its compatible bundled CUDA/cuDNN
 # runtime, so clear the external library overrides before importing torch.
+#
+# IMPORTANT: this server is shared/sensitive to high CPU load. Keep the
+# DataLoader worker count and CPU math-library thread counts deliberately low.
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATA_ROOT="${DATA_ROOT:-/data/pub1/z00919662/dataset/VIPSeg_13cls_video}"
@@ -14,7 +17,8 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 EPOCHS="${EPOCHS:-100}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}"
-WORKERS="${WORKERS:-8}"
+WORKERS="${WORKERS:-2}"
+CPU_THREADS="${CPU_THREADS:-1}"
 RESUME="${RESUME:-}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-/data/pub1/z00919662/segmentation/RobustVideoMatting-semantic-12class-512/output/rvm_semantic_12class_512_2gpu/best_miou.pth}"
 
@@ -43,6 +47,15 @@ unset LD_PRELOAD || true
 
 export CUDA_VISIBLE_DEVICES
 
+# Keep CPU pressure low on the shared server. These variables prevent a single
+# DataLoader/linear-algebra process from spawning a large CPU thread pool.
+export OMP_NUM_THREADS="${CPU_THREADS}"
+export MKL_NUM_THREADS="${CPU_THREADS}"
+export OPENBLAS_NUM_THREADS="${CPU_THREADS}"
+export NUMEXPR_NUM_THREADS="${CPU_THREADS}"
+export VECLIB_MAXIMUM_THREADS="${CPU_THREADS}"
+export TOKENIZERS_PARALLELISM=false
+
 if [[ -x "${PROJECT_ROOT}/.venv/bin/python" ]]; then
   PYTHON="${PROJECT_ROOT}/.venv/bin/python"
 else
@@ -54,12 +67,18 @@ fi
 import os
 import torch
 
+# Also cap PyTorch intra-op threads in this preflight process. The training
+# process inherits the OMP/MKL/OpenBLAS thread limits above.
+torch.set_num_threads(max(1, int(os.environ.get("OMP_NUM_THREADS", "1"))))
+
 print("=== Runtime check ===")
 print("torch:", torch.__version__)
 print("torch.version.cuda:", torch.version.cuda)
 print("cuDNN:", torch.backends.cudnn.version())
 print("cuda_available:", torch.cuda.is_available())
 print("visible_devices:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("OMP_NUM_THREADS:", os.environ.get("OMP_NUM_THREADS"))
+print("MKL_NUM_THREADS:", os.environ.get("MKL_NUM_THREADS"))
 if not torch.cuda.is_available():
     raise SystemExit("ERROR: CUDA is not available")
 print("logical cuda:0:", torch.cuda.get_device_name(0))
@@ -99,13 +118,18 @@ echo "EPOCHS=${EPOCHS}"
 echo "BATCH_SIZE=${BATCH_SIZE}"
 echo "GRADIENT_ACCUMULATION=${GRADIENT_ACCUMULATION}"
 echo "WORKERS=${WORKERS}"
+echo "CPU_THREADS=${CPU_THREADS}"
+echo "OMP_NUM_THREADS=${OMP_NUM_THREADS}"
+echo "MKL_NUM_THREADS=${MKL_NUM_THREADS}"
+echo "OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS}"
 echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH-<unset>}"
 echo "LD_PRELOAD=${LD_PRELOAD-<unset>}"
 
 # Intentionally use plain Python: no torchrun, no DDP, no NCCL rendezvous.
 # Do not pass --sync-bn; it is not needed for a single process/GPU.
+# nice +10 ensures this training job yields CPU time to other server users.
 set -o pipefail
-"${PYTHON}" train_video_semantic.py \
+nice -n 10 "${PYTHON}" train_video_semantic.py \
   --data-root "${DATA_ROOT}" \
   --output-dir "${OUTPUT_DIR}" \
   --variant mobilenetv3 \
