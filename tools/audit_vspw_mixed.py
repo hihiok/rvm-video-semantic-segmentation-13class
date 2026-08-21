@@ -66,7 +66,7 @@ def audit_split(image_root, mask_root, max_frames, video):
         invalid = [int(value) for value in values if value != 255 and not 0 <= value <= 12]
         if invalid:
             raise ValueError(f"Invalid IDs {invalid} in {mask_path}; expected 0..12 or 255")
-        video_name = str(relative.parent) if video else None
+        video_name = relative.parts[0] if video else None
         if video_name is not None:
             videos.add(video_name)
         for value, count in zip(values.tolist(), counts.tolist()):
@@ -76,7 +76,7 @@ def audit_split(image_root, mask_root, max_frames, video):
                 if video_name is not None:
                     class_videos[value].add(video_name)
 
-    all_videos = {str(relative.parent) for _, _, relative in pairs} if video else set()
+    all_videos = {relative.parts[0] for _, _, relative in pairs} if video else set()
     result = {
         "images": len(pairs),
         "checked_masks": len(selected),
