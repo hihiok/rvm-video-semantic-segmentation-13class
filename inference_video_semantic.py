@@ -25,6 +25,8 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--input-size", type=int, default=None)
+    parser.add_argument("--input-width", type=int, default=None)
+    parser.add_argument("--input-height", type=int, default=None)
     parser.add_argument("--resize-mode", choices=["letterbox", "stretch"], default="letterbox")
     parser.add_argument("--overlay-alpha", type=float, default=0.5)
     parser.add_argument("--recurrent", action=argparse.BooleanOptionalAction, default=True)
@@ -47,18 +49,43 @@ def find_videos(path: Path):
     return sorted(item for item in path.rglob("*") if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS)
 
 
+def normalize_spatial_size(size):
+    if isinstance(size, int):
+        return size, size
+    if isinstance(size, (tuple, list)) and len(size) == 2:
+        return int(size[0]), int(size[1])
+    raise ValueError(f"Expected an integer or (height, width), received {size!r}")
+
+
+def resolve_input_shape(args, checkpoint):
+    if args.input_width is not None or args.input_height is not None:
+        if args.input_width is None or args.input_height is None:
+            raise ValueError("--input-width and --input-height must be supplied together")
+        return args.input_height, args.input_width
+    if args.input_size is not None:
+        return args.input_size, args.input_size
+    if checkpoint.get("input_width") and checkpoint.get("input_height"):
+        return int(checkpoint["input_height"]), int(checkpoint["input_width"])
+    legacy_size = int(checkpoint.get("input_size", 512))
+    return legacy_size, legacy_size
+
+
 def letterbox_geometry(width, height, size):
-    scale = min(size / width, size / height)
-    resized_w = max(1, min(size, int(round(width * scale))))
-    resized_h = max(1, min(size, int(round(height * scale))))
-    left, top = (size - resized_w) // 2, (size - resized_h) // 2
-    return resized_w, resized_h, (left, top, size - resized_w - left, size - resized_h - top)
+    target_h, target_w = normalize_spatial_size(size)
+    scale = min(target_w / width, target_h / height)
+    resized_w = max(1, min(target_w, int(round(width * scale))))
+    resized_h = max(1, min(target_h, int(round(height * scale))))
+    left, top = (target_w - resized_w) // 2, (target_h - resized_h) // 2
+    return resized_w, resized_h, (
+        left, top, target_w - resized_w - left, target_h - resized_h - top
+    )
 
 
 def prepare_frame(frame_bgr, size, resize_mode):
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    target_h, target_w = normalize_spatial_size(size)
     if resize_mode == "stretch":
-        resized = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         geometry = None
     else:
         height, width = rgb.shape[:2]
@@ -195,7 +222,8 @@ def main():
     class_names = list(checkpoint.get("class_names", DEFAULT_CLASS_NAMES))
     if class_names != DEFAULT_CLASS_NAMES:
         raise ValueError(f"Checkpoint class mapping is not the fixed 13-class mapping: {class_names}")
-    input_size = args.input_size or int(checkpoint.get("input_size", 512))
+    input_size = resolve_input_shape(args, checkpoint)
+    print(f"Inference input resolution: {input_size[1]}x{input_size[0]}")
     model = RVMForVideoSemanticSegmentation(checkpoint.get("variant", "mobilenetv3"), len(class_names))
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval().to(args.device)

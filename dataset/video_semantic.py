@@ -1,6 +1,7 @@
 """Sequence-aware dataset and temporally consistent augmentation."""
 
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -57,13 +58,58 @@ def discover_video_sequences(image_root, mask_root) -> List[VideoSequence]:
     return sequences
 
 
-def letterbox_geometry(width: int, height: int, size: int):
-    scale = min(size / width, size / height)
-    resized_w = max(1, min(size, int(round(width * scale))))
-    resized_h = max(1, min(size, int(round(height * scale))))
-    left = (size - resized_w) // 2
-    top = (size - resized_h) // 2
-    return resized_w, resized_h, (left, top, size - resized_w - left, size - resized_h - top)
+def normalize_spatial_size(size):
+    """Return height,width; retain compatibility with existing square callers."""
+    if isinstance(size, int):
+        height = width = size
+    elif isinstance(size, (tuple, list)) and len(size) == 2:
+        height, width = int(size[0]), int(size[1])
+    else:
+        raise ValueError(f"Expected integer or (height, width), received {size!r}")
+    if height < 1 or width < 1:
+        raise ValueError(f"Spatial dimensions must be positive, received {height}x{width}")
+    return height, width
+
+
+def letterbox_geometry(width: int, height: int, size):
+    target_h, target_w = normalize_spatial_size(size)
+    scale = min(target_w / width, target_h / height)
+    resized_w = max(1, min(target_w, int(round(width * scale))))
+    resized_h = max(1, min(target_h, int(round(height * scale))))
+    left = (target_w - resized_w) // 2
+    top = (target_h - resized_h) // 2
+    return resized_w, resized_h, (
+        left, top, target_w - resized_w - left, target_h - resized_h - top
+    )
+
+
+def split_video_sequences_on_gaps(sequences, max_frame_gap):
+    """Prevent clips from treating filtered/missing VSPW frames as adjacent."""
+    if max_frame_gap <= 0:
+        return sequences
+    output = []
+    for sequence in sequences:
+        segments = []
+        previous_number = None
+        images, masks = [], []
+        for image, mask in zip(sequence.image_paths, sequence.mask_paths):
+            match = re.search(r"(\d+)$", image.stem)
+            number = int(match.group(1)) if match else None
+            if (
+                images and previous_number is not None and number is not None
+                and (number <= previous_number or number - previous_number > max_frame_gap)
+            ):
+                segments.append((tuple(images), tuple(masks)))
+                images, masks = [], []
+            images.append(image)
+            masks.append(mask)
+            previous_number = number
+        if images:
+            segments.append((tuple(images), tuple(masks)))
+        for index, (segment_images, segment_masks) in enumerate(segments):
+            name = sequence.name if len(segments) == 1 else f"{sequence.name}#segment{index:04d}"
+            output.append(VideoSequence(name, segment_images, segment_masks))
+    return output
 
 
 class VideoTrainTransform:
@@ -76,6 +122,7 @@ class VideoTrainTransform:
         hflip_probability=0.5,
         ignore_index=255,
     ):
+        self.height, self.width = normalize_spatial_size(size)
         self.size = size
         self.scale_range = scale_range
         self.hflip_probability = hflip_probability
@@ -87,18 +134,18 @@ class VideoTrainTransform:
             raise ValueError("All frames in a clip must have identical resolution")
 
         scale = random.uniform(*self.scale_range)
-        short_side = max(1, int(min(source_h, source_w) * scale))
-        resize_scale = short_side / min(source_h, source_w)
+        base_scale = min(self.width / source_w, self.height / source_h)
+        resize_scale = base_scale * scale
         new_h = max(1, int(round(source_h * resize_scale)))
         new_w = max(1, int(round(source_w * resize_scale)))
-        pad_right = max(0, self.size - new_w)
-        pad_bottom = max(0, self.size - new_h)
+        pad_right = max(0, self.width - new_w)
+        pad_bottom = max(0, self.height - new_h)
 
         # RandomCrop only needs the resulting canvas geometry; sample once.
         canvas_h = new_h + pad_bottom
         canvas_w = new_w + pad_right
-        top = random.randint(0, canvas_h - self.size)
-        left = random.randint(0, canvas_w - self.size)
+        top = random.randint(0, canvas_h - self.height)
+        left = random.randint(0, canvas_w - self.width)
         do_flip = random.random() < self.hflip_probability
 
         brightness = random.uniform(0.8, 1.2)
@@ -120,8 +167,8 @@ class VideoTrainTransform:
             if pad_right or pad_bottom:
                 image = F.pad(image, [0, 0, pad_right, pad_bottom], fill=0)
                 mask = F.pad(mask, [0, 0, pad_right, pad_bottom], fill=self.ignore_index)
-            image = F.crop(image, top, left, self.size, self.size)
-            mask = F.crop(mask, top, left, self.size, self.size)
+            image = F.crop(image, top, left, self.height, self.width)
+            mask = F.crop(mask, top, left, self.height, self.width)
             if do_flip:
                 image, mask = F.hflip(image), F.hflip(mask)
             for operation in color_ops:
@@ -135,6 +182,7 @@ class VideoValidTransform:
     def __init__(self, size=512, resize_mode="letterbox", ignore_index=255):
         if resize_mode not in ("letterbox", "stretch"):
             raise ValueError("resize_mode must be letterbox or stretch")
+        self.height, self.width = normalize_spatial_size(size)
         self.size = size
         self.resize_mode = resize_mode
         self.ignore_index = ignore_index
@@ -143,8 +191,8 @@ class VideoValidTransform:
         output_images, output_masks = [], []
         for image, mask in zip(images, masks):
             if self.resize_mode == "stretch":
-                image = F.resize(image, [self.size, self.size], interpolation=InterpolationMode.BILINEAR)
-                mask = F.resize(mask, [self.size, self.size], interpolation=InterpolationMode.NEAREST)
+                image = F.resize(image, [self.height, self.width], interpolation=InterpolationMode.BILINEAR)
+                mask = F.resize(mask, [self.height, self.width], interpolation=InterpolationMode.NEAREST)
             else:
                 resized_w, resized_h, padding = letterbox_geometry(image.width, image.height, self.size)
                 image = F.resize(image, [resized_h, resized_w], interpolation=InterpolationMode.BILINEAR)
@@ -177,10 +225,13 @@ class VideoClipDataset(Dataset):
         ignore_index=255,
         temporal_reverse_probability=0.0,
         minimum_valid_frames=1,
+        max_frame_gap=0,
     ):
         if clip_length < 1 or frame_stride < 1:
             raise ValueError("clip_length and frame_stride must be positive")
-        self.sequences = discover_video_sequences(image_root, mask_root)
+        self.sequences = split_video_sequences_on_gaps(
+            discover_video_sequences(image_root, mask_root), max_frame_gap
+        )
         self.num_classes = num_classes
         self.clip_length = clip_length
         self.frame_stride = frame_stride

@@ -5,16 +5,42 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import random
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.transforms import functional as F
 
-from .video_semantic import IMAGE_EXTENSIONS, MASK_EXTENSIONS
+from .video_semantic import IMAGE_EXTENSIONS, MASK_EXTENSIONS, normalize_spatial_size
 
 
 @dataclass(frozen=True)
 class StaticSplitPaths:
     image_root: Path
     mask_root: Path
+
+
+class PreparedStaticTransform:
+    """Use pre-sized offline images directly; no per-epoch resize/crop/padding."""
+
+    def __init__(self, size, hflip_probability=0.0):
+        self.height, self.width = normalize_spatial_size(size)
+        self.hflip_probability = hflip_probability
+
+    def __call__(self, images, masks):
+        output_images, output_masks = [], []
+        do_flip = random.random() < self.hflip_probability
+        for image, mask in zip(images, masks):
+            if image.size != (self.width, self.height) or mask.size != (self.width, self.height):
+                raise ValueError(
+                    f"Prepared static image/mask must already be {self.width}x{self.height}; "
+                    f"received {image.size} and {mask.size}. Run tools/prepare_static_16x9.py first."
+                )
+            if do_flip:
+                image, mask = F.hflip(image), F.hflip(mask)
+            output_images.append(F.to_tensor(image))
+            output_masks.append(torch.from_numpy(np.array(mask, dtype=np.int64, copy=True)))
+        return torch.stack(output_images), torch.stack(output_masks)
 
 
 def resolve_static_split(root, split: str, image_override=None, mask_override=None):

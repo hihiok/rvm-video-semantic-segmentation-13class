@@ -7,7 +7,16 @@ import pytest
 import torch
 from PIL import Image
 
-from dataset import StaticSemanticDataset, VideoTrainTransform, resolve_static_split
+from dataset import (
+    PreparedStaticTransform,
+    StaticSemanticDataset,
+    VideoTrainTransform,
+    VideoValidTransform,
+    letterbox_geometry,
+    resolve_static_split,
+    split_video_sequences_on_gaps,
+)
+from dataset.video_semantic import VideoSequence
 from train_vspw_mixed import balanced_score, mixed_batch_sources, parse_args, stage_for_epoch
 
 
@@ -50,6 +59,44 @@ def test_static_dataset_rejects_unknown_labels(tmp_path):
         dataset[0]
 
 
+def test_rectangular_video_transforms_preserve_exact_16x9_shape():
+    image = Image.fromarray(np.full((72, 128, 3), 100, dtype=np.uint8))
+    mask = Image.fromarray(np.full((72, 128), 1, dtype=np.uint8))
+    random.seed(3)
+    train_images, train_masks = VideoTrainTransform(
+        size=(360, 640), scale_range=(1, 1)
+    )([image, image], [mask, mask])
+    valid_images, valid_masks = VideoValidTransform(size=(360, 640))([image], [mask])
+    assert train_images.shape == (2, 3, 360, 640)
+    assert train_masks.shape == (2, 360, 640)
+    assert valid_images.shape == (1, 3, 360, 640)
+    assert valid_masks.shape == (1, 360, 640)
+    assert letterbox_geometry(1280, 720, (360, 640)) == (640, 360, (0, 0, 0, 0))
+
+
+def test_prepared_static_transform_skips_geometry_and_checks_size():
+    image = Image.fromarray(np.full((360, 640, 3), 100, dtype=np.uint8))
+    mask = Image.fromarray(np.full((360, 640), 12, dtype=np.uint8))
+    images, masks = PreparedStaticTransform((360, 640))([image], [mask])
+    assert images.shape == (1, 3, 360, 640)
+    assert masks.shape == (1, 360, 640)
+    assert masks.unique().tolist() == [12]
+    with pytest.raises(ValueError, match="already be 640x360"):
+        PreparedStaticTransform((360, 640))(
+            [Image.fromarray(np.zeros((320, 640, 3), dtype=np.uint8))],
+            [Image.fromarray(np.zeros((320, 640), dtype=np.uint8))],
+        )
+
+
+def test_filtered_vspw_frame_gaps_split_recurrent_sequences(tmp_path):
+    paths = tuple(tmp_path / f"{index:05d}.png" for index in (1, 2, 4, 5))
+    sequence = VideoSequence("video", paths, paths)
+    segments = split_video_sequences_on_gaps([sequence], 1)
+    assert [len(item.image_paths) for item in segments] == [2, 2]
+    assert segments[0].name == "video#segment0000"
+    assert segments[1].name == "video#segment0001"
+
+
 def test_source_schedule_keeps_replay_after_partial_final_group():
     assert list(mixed_batch_sources(5, 2, 1)) == [
         "video", "video", "static", "video", "video", "static", "video", "static"
@@ -67,6 +114,7 @@ def test_stage_transition_increases_clip_length_and_video_ratio(tmp_path):
     assert stage_for_epoch(args, 1)["video_batches"] == 1
     assert stage_for_epoch(args, 2)["clip_length"] == 8
     assert stage_for_epoch(args, 2)["video_batches"] == 2
+    assert (args.input_width, args.input_height) == (640, 360)
 
 
 def test_balanced_score_uses_both_validation_domains():

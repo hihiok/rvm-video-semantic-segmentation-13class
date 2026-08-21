@@ -116,12 +116,47 @@ Static images are represented as one-frame clips, which resets recurrent state
 between unrelated photographs. Real VSPW clips propagate all four ConvGRU
 states and use full-clip BPTT by default.
 
+Training, validation and video inference use **640×360 (16:9)** by default.
+The decoder already crops upsampled activations to their actual skip-feature
+dimensions, so a height of 360 does not require changing the RVM architecture.
+
+Before training, create the static 16:9 dataset once:
+
+```bash
+bash scripts/prepare_static_16x9.sh
+```
+
+The immutable source is:
+
+```text
+/data/pub1/z00919662/segmentation/RobustVideoMatting-semantic-13class-512/data
+```
+
+The generated output is:
+
+```text
+/data/pub1/z00919662/segmentation/datasets/COCO_ADE_13cls_16x9_640x360
+```
+
+For training images, a deterministic per-image random choice selects a 16:9
+crop or aspect-preserving padding. Crops must retain every source foreground
+class and at least 45% of foreground pixels; unsafe crops fall back to padding.
+Validation images always preserve the complete original image with padding.
+Image padding is black, mask padding is ignore label 255, images are resized
+bilinearly, and masks are resized with nearest-neighbor interpolation. The
+resulting JPEG/PNG pairs are already exactly 640×360, so static replay does no
+per-epoch resizing, cropping or padding.
+
+The generated `PREPARED_16X9_MANIFEST.json` includes source-resolution
+statistics, crop/padding counts and per-class pixels. Training refuses to start
+if this manifest is missing, the size is wrong, or the class mapping differs.
+
 The default curriculum runs as one resumable training job:
 
-| Stage | Epochs | VSPW clip length | Video/static batch ratio |
-|---|---:|---:|---:|
-| Mixed domain adaptation | 20 | 5 | 1:1 |
-| Temporal fine-tuning | 60 | 8 | 2:1 |
+| Stage | Epochs | Input | VSPW clip length | Video/static batch ratio |
+|---|---:|---:|---:|---:|
+| Mixed domain adaptation | 20 | 640×360 | 5 | 1:1 |
+| Temporal fine-tuning | 60 | 640×360 | 8 | 2:1 |
 
 Each epoch reports separate VSPW and static validation mIoU. The selected
 `best_balanced.pth` / `best_miou.pth` maximizes the weighted mean of both mIoUs
@@ -133,18 +168,22 @@ adjacent frames. It is not used as a training loss.
 
 The launcher validates converted VSPW masks, checks train/validation video
 leakage, audits both sources' 13-class coverage, selects available GPUs, and
-uses the confirmed original static dataset location:
+uses the offline-prepared static dataset. If VSPW conversion removed frames
+without target classes, clips are split at numeric frame gaps instead of
+silently passing ConvGRU state across missing frames:
 
 ```bash
-STATIC_ROOT=/data/pub1/z00919662/segmentation/RobustVideoMatting-semantic-13class-512/data \
+STATIC_ROOT=/data/pub1/z00919662/segmentation/datasets/COCO_ADE_13cls_16x9_640x360 \
 VSPW_ROOT=/data/pub1/z00919662/segmentation/datasets/VSPW_13cls \
 INIT_CHECKPOINT=/data/pub1/z00919662/segmentation/RobustVideoMatting-semantic-13class-512/output/rvm_semantic_13class_512_2gpu/best_miou.pth \
 bash scripts/train_vspw_mixed.sh
 ```
 
-`STATIC_ROOT` defaults to the confirmed path shown above. Explicitly set
-`AUTO_DISCOVER_STATIC_ROOT=1` only if that dataset was moved and must be located
-from checkpoint/project metadata.
+`STATIC_ROOT` defaults to the prepared path shown above; the original image
+dataset is never modified. The first-stage 512-resolution checkpoint is reused
+without architectural changes. New checkpoints store `input_width=640` and
+`input_height=360`, and the updated inference/evaluation scripts select the
+rectangular size automatically.
 Set `CUDA_VISIBLE_DEVICES=3` for one GPU, or `CUDA_VISIBLE_DEVICES=3,4` for two.
 Resume with `RESUME=/path/to/last.pth bash scripts/train_vspw_mixed.sh`.
 Both `train` and `val` static image/mask splits are required; the script will not

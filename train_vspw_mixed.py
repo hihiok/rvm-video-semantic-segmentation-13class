@@ -15,6 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from dataset import (
+    PreparedStaticTransform,
     StaticSemanticDataset,
     VideoClipDataset,
     VideoTrainTransform,
@@ -63,7 +64,9 @@ def parse_args(argv=None):
     parser.add_argument("--class-names", default=",".join(DEFAULT_CLASS_NAMES))
     parser.add_argument("--ignore-index", type=int, default=255)
     parser.add_argument("--variant", choices=("mobilenetv3", "resnet50"), default="mobilenetv3")
-    parser.add_argument("--input-size", type=int, default=512)
+    parser.add_argument("--input-width", type=int, default=640)
+    parser.add_argument("--input-height", type=int, default=360)
+    parser.add_argument("--prepared-static-manifest", default="PREPARED_16X9_MANIFEST.json")
     parser.add_argument("--stage2-epochs", type=int, default=20)
     parser.add_argument("--stage3-epochs", type=int, default=60)
     parser.add_argument("--stage2-clip-length", type=int, default=5)
@@ -73,6 +76,10 @@ def parse_args(argv=None):
     parser.add_argument("--stage3-video-batches", type=int, default=2)
     parser.add_argument("--stage3-static-batches", type=int, default=1)
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument(
+        "--max-frame-gap", type=int, default=1,
+        help="Split clips when retained numeric frame IDs are more than this distance apart; 0 disables.",
+    )
     parser.add_argument("--train-clip-step", type=int, default=0, help="0 uses stage clip length")
     parser.add_argument("--val-clip-step", type=int, default=0, help="0 uses stage clip length")
     parser.add_argument("--temporal-reverse-probability", type=float, default=0.2)
@@ -92,8 +99,8 @@ def parse_args(argv=None):
     parser.add_argument("--class-weights", default=None)
     parser.add_argument("--video-loss-weight", type=float, default=1.0)
     parser.add_argument("--static-loss-weight", type=float, default=1.0)
-    parser.add_argument("--train-scale-min", type=float, default=0.5)
-    parser.add_argument("--train-scale-max", type=float, default=1.5)
+    parser.add_argument("--train-scale-min", type=float, default=0.9)
+    parser.add_argument("--train-scale-max", type=float, default=1.1)
     parser.add_argument("--val-resize-mode", choices=("letterbox", "stretch"), default="letterbox")
     parser.add_argument("--gradient-accumulation", type=int, default=1)
     parser.add_argument("--clip-grad-norm", type=float, default=5.0)
@@ -122,6 +129,12 @@ def parse_args(argv=None):
             parser.error(f"--{field.replace('_', '-')} must be at least 1")
     if not 0 <= args.static_validation_weight <= 1:
         parser.error("--static-validation-weight must be between 0 and 1")
+    if args.input_width < 1 or args.input_height < 1 or args.input_width * 9 != args.input_height * 16:
+        parser.error("--input-width and --input-height must form an exact positive 16:9 ratio")
+    if args.max_frame_gap < 0:
+        parser.error("--max-frame-gap cannot be negative")
+    # Keep legacy checkpoint consumers compatible while explicitly recording both dimensions.
+    args.input_size = args.input_width
     args.epochs = args.stage2_epochs + args.stage3_epochs
     return args
 
@@ -149,12 +162,32 @@ def _subset(dataset, maximum):
 
 
 def make_loaders(args, stage, num_classes, distributed, rank, world_size):
+    manifest_path = args.static_root / args.prepared_static_manifest
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing offline-prepared static manifest: {manifest_path}. "
+            "Run tools/prepare_static_16x9.py before starting training."
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("format") != "prepared_static_semantic_16x9_v1"
+        or manifest.get("input_width") != args.input_width
+        or manifest.get("input_height") != args.input_height
+        or manifest.get("class_names") != DEFAULT_CLASS_NAMES
+    ):
+        raise ValueError(
+            f"Prepared static manifest is incompatible with requested {args.input_width}x"
+            f"{args.input_height} fixed 13-class training: {manifest_path}"
+        )
+    target_size = (args.input_height, args.input_width)
     train_transform = VideoTrainTransform(
-        args.input_size,
+        target_size,
         (args.train_scale_min, args.train_scale_max),
         ignore_index=args.ignore_index,
     )
-    valid_transform = VideoValidTransform(args.input_size, args.val_resize_mode, args.ignore_index)
+    valid_transform = VideoValidTransform(target_size, args.val_resize_mode, args.ignore_index)
+    static_train_transform = PreparedStaticTransform(target_size, hflip_probability=0.5)
+    static_valid_transform = PreparedStaticTransform(target_size)
     clip_length = stage["clip_length"]
     train_video = VideoClipDataset(
         args.data_root / args.train_images,
@@ -167,6 +200,7 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
         ignore_index=args.ignore_index,
         temporal_reverse_probability=args.temporal_reverse_probability,
         minimum_valid_frames=min(2, clip_length),
+        max_frame_gap=args.max_frame_gap,
     )
     val_video = VideoClipDataset(
         args.data_root / args.val_images,
@@ -177,6 +211,7 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
         clip_step=args.val_clip_step or clip_length * args.frame_stride,
         transform=valid_transform,
         ignore_index=args.ignore_index,
+        max_frame_gap=args.max_frame_gap,
     )
     train_video = _subset(train_video, args.max_train_clips)
     val_video = _subset(val_video, args.max_val_clips)
@@ -188,12 +223,12 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
         args.static_root, "val", args.static_val_images, args.static_val_annotations
     )
     train_static = StaticSemanticDataset(
-        train_paths.image_root, train_paths.mask_root, train_transform,
+        train_paths.image_root, train_paths.mask_root, static_train_transform,
         num_classes=num_classes, ignore_index=args.ignore_index,
         max_samples=args.max_static_train_images,
     )
     val_static = StaticSemanticDataset(
-        val_paths.image_root, val_paths.mask_root, valid_transform,
+        val_paths.image_root, val_paths.mask_root, static_valid_transform,
         num_classes=num_classes, ignore_index=args.ignore_index,
         max_samples=args.max_static_val_images,
     )
@@ -237,6 +272,9 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
     if rank == 0:
         print(json.dumps({
             "stage": stage,
+            "input_width": args.input_width,
+            "input_height": args.input_height,
+            "offline_prepared_static_manifest": str(manifest_path),
             "vspw_train_clips": len(train_video),
             "vspw_val_clips": len(val_video),
             "static_train_images": len(train_static),
@@ -378,6 +416,9 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, args, class_n
         "num_classes": len(class_names),
         "class_names": class_names,
         "input_size": args.input_size,
+        "input_width": args.input_width,
+        "input_height": args.input_height,
+        "input_aspect_ratio": "16:9",
         "clip_length": stage["clip_length"],
         "frame_stride": args.frame_stride,
         "video_training": True,
@@ -453,6 +494,7 @@ def main(argv=None):
         print(json.dumps({
             "class_names": class_names, "device": str(device), "world_size": world_size,
             "stage2_epochs": args.stage2_epochs, "stage3_epochs": args.stage3_epochs,
+            "input_width": args.input_width, "input_height": args.input_height,
             "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
             "resume": str(args.resume) if args.resume else None,
         }, indent=2))

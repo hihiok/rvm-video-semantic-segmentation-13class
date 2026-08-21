@@ -8,8 +8,10 @@ cd "${REPO_ROOT}"
 VSPW_ROOT="${VSPW_ROOT:-/data/pub1/z00919662/segmentation/datasets/VSPW_13cls}"
 SOURCE_PROJECT="${SOURCE_PROJECT:-/data/pub1/z00919662/segmentation/RobustVideoMatting-semantic-13class-512}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-${SOURCE_PROJECT}/output/rvm_semantic_13class_512_2gpu/best_miou.pth}"
-STATIC_ROOT="${STATIC_ROOT:-${SOURCE_PROJECT}/data}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data/pub1/z00919662/segmentation/rvm-video-semantic-segmentation-13class/output/rvm_vspw_mixed_13class}"
+ORIGINAL_STATIC_ROOT="${ORIGINAL_STATIC_ROOT:-${SOURCE_PROJECT}/data}"
+PREPARED_STATIC_ROOT="${PREPARED_STATIC_ROOT:-/data/pub1/z00919662/segmentation/datasets/COCO_ADE_13cls_16x9_640x360}"
+STATIC_ROOT="${STATIC_ROOT:-${PREPARED_STATIC_ROOT}}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/pub1/z00919662/segmentation/rvm-video-semantic-segmentation-13class/output/rvm_vspw_mixed_13class_640x360}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-20}"
 STAGE3_EPOCHS="${STAGE3_EPOCHS:-60}"
 VIDEO_BATCH_SIZE="${VIDEO_BATCH_SIZE:-2}"
@@ -28,15 +30,13 @@ if [[ ! -f "${INIT_CHECKPOINT}" && -z "${RESUME:-}" ]]; then
   exit 2
 fi
 
-if [[ ! -d "${STATIC_ROOT}" && "${AUTO_DISCOVER_STATIC_ROOT:-0}" == "1" ]]; then
-  STATIC_ROOT="$(python tools/resolve_static_dataset.py \
-    --checkpoint "${INIT_CHECKPOINT}" \
-    --source-project "${SOURCE_PROJECT}" \
-    --root-only)"
-fi
 if [[ ! -d "${STATIC_ROOT}" ]]; then
-  printf 'ERROR: expected COCO+ADE13 static replay dataset does not exist: %s\n' "${STATIC_ROOT}" >&2
-  printf 'Set STATIC_ROOT explicitly only if the confirmed dataset was moved.\n' >&2
+  printf 'ERROR: offline-prepared 16:9 static replay dataset does not exist: %s\n' "${STATIC_ROOT}" >&2
+  printf 'Run bash scripts/prepare_static_16x9.sh before starting training.\n' >&2
+  exit 2
+fi
+if [[ ! -f "${STATIC_ROOT}/PREPARED_16X9_MANIFEST.json" ]]; then
+  printf 'ERROR: offline-prepared static dataset manifest is missing: %s/PREPARED_16X9_MANIFEST.json\n' "${STATIC_ROOT}" >&2
   exit 2
 fi
 
@@ -96,7 +96,9 @@ args=(
   --batch-size "${VIDEO_BATCH_SIZE}"
   --static-batch-size "${STATIC_BATCH_SIZE}"
   --workers "${WORKERS}"
-  --input-size "${INPUT_SIZE:-512}"
+  --input-width "${INPUT_WIDTH:-640}"
+  --input-height "${INPUT_HEIGHT:-360}"
+  --max-frame-gap "${MAX_FRAME_GAP:-1}"
   --learning-rate "${LEARNING_RATE:-5e-5}"
   --backbone-learning-rate "${BACKBONE_LEARNING_RATE:-5e-6}"
   --static-validation-weight "${STATIC_VALIDATION_WEIGHT:-0.5}"
@@ -109,8 +111,9 @@ else
   args+=(--init-checkpoint "${INIT_CHECKPOINT}")
 fi
 
-printf 'VSPW_ROOT=%s\nSTATIC_ROOT=%s\nCUDA_VISIBLE_DEVICES=%s\nNPROC_PER_NODE=%s\nOUTPUT_DIR=%s\n' \
-  "${VSPW_ROOT}" "${STATIC_ROOT}" "${CUDA_VISIBLE_DEVICES}" "${NPROC_PER_NODE}" "${OUTPUT_DIR}"
+printf 'VSPW_ROOT=%s\nORIGINAL_STATIC_ROOT=%s\nPREPARED_STATIC_ROOT=%s\nINPUT_WIDTH=%s\nINPUT_HEIGHT=%s\nCUDA_VISIBLE_DEVICES=%s\nNPROC_PER_NODE=%s\nOUTPUT_DIR=%s\n' \
+  "${VSPW_ROOT}" "${ORIGINAL_STATIC_ROOT}" "${STATIC_ROOT}" "${INPUT_WIDTH:-640}" "${INPUT_HEIGHT:-360}" \
+  "${CUDA_VISIBLE_DEVICES}" "${NPROC_PER_NODE}" "${OUTPUT_DIR}"
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   exec torchrun --standalone --nnodes=1 --nproc_per_node "${NPROC_PER_NODE}" \
     --master_port "${MASTER_PORT}" train_vspw_mixed.py "${args[@]}"

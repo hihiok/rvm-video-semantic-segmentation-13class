@@ -23,6 +23,8 @@ def parse_args():
     parser.add_argument("--images", default="images/test")
     parser.add_argument("--annotations", default="annotations/test")
     parser.add_argument("--input-size", type=int, default=None)
+    parser.add_argument("--input-width", type=int, default=None)
+    parser.add_argument("--input-height", type=int, default=None)
     parser.add_argument("--clip-length", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--resize-mode", choices=["letterbox", "stretch"], default="letterbox")
@@ -47,7 +49,16 @@ def main():
     class_names = list(checkpoint.get("class_names", DEFAULT_CLASS_NAMES))
     if class_names != DEFAULT_CLASS_NAMES:
         raise ValueError(f"Expected the fixed 13-class mapping, got {class_names}")
-    input_size = args.input_size or int(checkpoint.get("input_size", 512))
+    if args.input_width is not None or args.input_height is not None:
+        if args.input_width is None or args.input_height is None:
+            raise ValueError("--input-width and --input-height must be supplied together")
+        input_size = (args.input_height, args.input_width)
+    elif args.input_size is not None:
+        input_size = args.input_size
+    elif checkpoint.get("input_width") and checkpoint.get("input_height"):
+        input_size = (int(checkpoint["input_height"]), int(checkpoint["input_width"]))
+    else:
+        input_size = int(checkpoint.get("input_size", 512))
     clip_length = args.clip_length or int(checkpoint.get("clip_length", 5))
     dataset = VideoClipDataset(
         args.data_root / args.images,
