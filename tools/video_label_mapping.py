@@ -41,7 +41,8 @@ def semantic_category_ids(raw_mask, panoptic):
     values = raw_mask.astype(np.int64, copy=False)
     if panoptic:
         values = np.where(values > 124, values // 100, values)
-    invalid = (values < 0) | (values > 124)
+    source_ignore = (values == 255) if not panoptic else np.zeros(values.shape, dtype=bool)
+    invalid = ((values < 0) | (values > 124)) & ~source_ignore
     if invalid.any():
         raise ValueError(f"Invalid source category IDs: {np.unique(values[invalid]).tolist()}")
     return values
@@ -50,7 +51,7 @@ def semantic_category_ids(raw_mask, panoptic):
 def convert_mask(raw_mask, raw_to_target, ignore_index=255, panoptic=True):
     category_ids = semantic_category_ids(raw_mask, panoptic=panoptic)
     output = np.zeros(category_ids.shape, dtype=np.uint8)
-    output[category_ids == 0] = ignore_index
+    output[(category_ids == 0) | (category_ids == 255)] = ignore_index
     for raw_id, target_id in raw_to_target.items():
         output[category_ids == raw_id] = target_id
     return output
