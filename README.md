@@ -108,6 +108,48 @@ Cityscapes-VPS and KITTI-STEP are real video segmentation datasets, but are driv
 
 ## Training
 
+### COCO+ADE13 initialization and VSPW mixed video fine-tuning
+
+`train_vspw_mixed.py` starts from an already-trained **13-class** image model and
+jointly trains on chronological VSPW clips and independent COCO+ADE13 images.
+Static images are represented as one-frame clips, which resets recurrent state
+between unrelated photographs. Real VSPW clips propagate all four ConvGRU
+states and use full-clip BPTT by default.
+
+The default curriculum runs as one resumable training job:
+
+| Stage | Epochs | VSPW clip length | Video/static batch ratio |
+|---|---:|---:|---:|
+| Mixed domain adaptation | 20 | 5 | 1:1 |
+| Temporal fine-tuning | 60 | 8 | 2:1 |
+
+Each epoch reports separate VSPW and static validation mIoU. The selected
+`best_balanced.pth` / `best_miou.pth` maximizes the weighted mean of both mIoUs
+while requiring static mIoU to remain within 0.03 of its initial baseline.
+`best_video_miou.pth` and `best_static_miou.pth` are also saved independently.
+`stable_gt_flip_rate` is an optical-flow-free diagnostic: prediction changes are
+counted only at pixels whose valid ground-truth class remains unchanged between
+adjacent frames. It is not used as a training loss.
+
+The launcher validates converted VSPW masks, checks train/validation video
+leakage, audits both sources' 13-class coverage, selects available GPUs, and
+uses the confirmed original static dataset location:
+
+```bash
+STATIC_ROOT=/data/pub1/z00919662/segmentation/RobustVideoMatting-semantic-13class-512/data \
+VSPW_ROOT=/data/pub1/z00919662/segmentation/datasets/VSPW_13cls \
+INIT_CHECKPOINT=/data/pub1/z00919662/segmentation/RobustVideoMatting-semantic-13class-512/output/rvm_semantic_13class_512_2gpu/best_miou.pth \
+bash scripts/train_vspw_mixed.sh
+```
+
+`STATIC_ROOT` defaults to the confirmed path shown above. Explicitly set
+`AUTO_DISCOVER_STATIC_ROOT=1` only if that dataset was moved and must be located
+from checkpoint/project metadata.
+Set `CUDA_VISIBLE_DEVICES=3` for one GPU, or `CUDA_VISIBLE_DEVICES=3,4` for two.
+Resume with `RESUME=/path/to/last.pth bash scripts/train_vspw_mixed.sh`.
+Both `train` and `val` static image/mask splits are required; the script will not
+silently substitute VSPW validation or train without replay data.
+
 Quick model check:
 
 ```bash
