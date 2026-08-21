@@ -28,7 +28,7 @@ def test_filters_no_target_frames_and_splits_temporal_runs(tmp_path):
     (source / "train.txt").write_text("video_a\n", encoding="utf-8")
     # raw 1 -> sky(target 1), raw 2 -> road(non-target/background), raw 3 -> person(target 2)
     write_source_frame(source, "video_a", "0000", np.array([[1, 2], [2, 2]]))
-    write_source_frame(source, "video_a", "0001", np.array([[0, 2], [2, 2]]))
+    write_source_frame(source, "video_a", "0001", np.array([[0, 2], [255, 2]]))
     write_source_frame(source, "video_a", "0002", np.array([[3, 2], [2, 2]]))
 
     categories = [
