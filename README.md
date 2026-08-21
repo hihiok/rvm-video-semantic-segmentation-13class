@@ -48,7 +48,7 @@ DATA_ROOT/
     └── test/<video_id>/<frame>.png
 ```
 
-Frames are sorted lexicographically inside each video, so filenames must be zero-padded or naturally sortable in chronological order.
+Frames are sorted inside each leaf sequence directory. Filtered VSPW data uses an extra `<video_id>/segment_NNNN/` level so clips never bridge a removed frame; the loader supports both direct video folders and these segment folders.
 
 ## VIPSeg conversion
 
@@ -101,8 +101,18 @@ VSPW is the most useful additional dataset for these broad scene classes. A conv
 python tools/prepare_vspw_13class.py \
   --vspw-root /path/to/VSPW_480p \
   --categories-json /path/to/panoVIPSeg_categories.json \
-  --output-root /data/pub1/z00919662/dataset/VSPW_13cls_video
+  --output-root /data/pub1/z00919662/segmentation/datasets/VSPW_13cls \
+  --splits train,val \
+  --copy-mode hardlink \
+  --minimum-target-pixels 1
+
+python tools/check_video_dataset.py \
+  --data-root /data/pub1/z00919662/segmentation/datasets/VSPW_13cls \
+  --splits train,val \
+  --require-target
 ```
+
+The converter uses official VSPW `origin` images and same-resolution masks. It keeps a frame only when the mapped mask contains at least one foreground target ID `1..12`; masks containing only background `0` and/or ignore `255` are omitted. Each retained run is written below `<video_id>/segment_NNNN/` to preserve temporal boundaries.
 
 Cityscapes-VPS and KITTI-STEP are real video segmentation datasets, but are driving-scene focused and have poor coverage of food, flower, desert, ice/snow, text, ball, and mountain. They are not recommended as the main training source for this taxonomy. Static COCO-Stuff/ADE20K data remains useful for initialization, but cannot train temporal recurrence by itself.
 
