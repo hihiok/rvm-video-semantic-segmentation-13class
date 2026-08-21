@@ -12,8 +12,8 @@ def test_vipseg_panoptic_decoding():
     np.testing.assert_array_equal(converted, expected)
 
 
-def test_vspw_semantic_decoding():
-    raw = np.array([[0, 29, 61, 30]], dtype=np.uint8)
+def test_vspw_semantic_decoding_preserves_source_ignore():
+    raw = np.array([[0, 29, 61, 30, 255]], dtype=np.uint8)
     mapping = {29: 1, 61: 2, 30: 12}
-    expected = np.array([[255, 1, 2, 12]], dtype=np.uint8)
+    expected = np.array([[255, 1, 2, 12, 255]], dtype=np.uint8)
     np.testing.assert_array_equal(convert_mask(raw, mapping, panoptic=False), expected)
