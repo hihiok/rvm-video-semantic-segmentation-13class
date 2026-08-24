@@ -57,13 +57,29 @@ def discover_video_sequences(image_root, mask_root) -> List[VideoSequence]:
     return sequences
 
 
-def letterbox_geometry(width: int, height: int, size: int):
-    scale = min(size / width, size / height)
-    resized_w = max(1, min(size, int(round(width * scale))))
-    resized_h = max(1, min(size, int(round(height * scale))))
-    left = (size - resized_w) // 2
-    top = (size - resized_h) // 2
-    return resized_w, resized_h, (left, top, size - resized_w - left, size - resized_h - top)
+def normalize_spatial_size(size):
+    """Return ``(height, width)`` while retaining legacy square-size support."""
+    if isinstance(size, int):
+        height = width = size
+    elif isinstance(size, (tuple, list)) and len(size) == 2:
+        height, width = size
+    else:
+        raise ValueError("Input size must be an integer or a (height, width) pair")
+    if not isinstance(height, int) or not isinstance(width, int) or min(height, width) < 1:
+        raise ValueError("Input height and width must be positive integers")
+    return height, width
+
+
+def letterbox_geometry(width: int, height: int, size):
+    target_h, target_w = normalize_spatial_size(size)
+    scale = min(target_w / width, target_h / height)
+    resized_w = max(1, min(target_w, int(round(width * scale))))
+    resized_h = max(1, min(target_h, int(round(height * scale))))
+    left = (target_w - resized_w) // 2
+    top = (target_h - resized_h) // 2
+    return resized_w, resized_h, (
+        left, top, target_w - resized_w - left, target_h - resized_h - top
+    )
 
 
 class VideoTrainTransform:
@@ -77,6 +93,7 @@ class VideoTrainTransform:
         ignore_index=255,
     ):
         self.size = size
+        self.height, self.width = normalize_spatial_size(size)
         self.scale_range = scale_range
         self.hflip_probability = hflip_probability
         self.ignore_index = ignore_index
@@ -91,14 +108,14 @@ class VideoTrainTransform:
         resize_scale = short_side / min(source_h, source_w)
         new_h = max(1, int(round(source_h * resize_scale)))
         new_w = max(1, int(round(source_w * resize_scale)))
-        pad_right = max(0, self.size - new_w)
-        pad_bottom = max(0, self.size - new_h)
+        pad_right = max(0, self.width - new_w)
+        pad_bottom = max(0, self.height - new_h)
 
         # RandomCrop only needs the resulting canvas geometry; sample once.
         canvas_h = new_h + pad_bottom
         canvas_w = new_w + pad_right
-        top = random.randint(0, canvas_h - self.size)
-        left = random.randint(0, canvas_w - self.size)
+        top = random.randint(0, canvas_h - self.height)
+        left = random.randint(0, canvas_w - self.width)
         do_flip = random.random() < self.hflip_probability
 
         brightness = random.uniform(0.8, 1.2)
@@ -120,8 +137,8 @@ class VideoTrainTransform:
             if pad_right or pad_bottom:
                 image = F.pad(image, [0, 0, pad_right, pad_bottom], fill=0)
                 mask = F.pad(mask, [0, 0, pad_right, pad_bottom], fill=self.ignore_index)
-            image = F.crop(image, top, left, self.size, self.size)
-            mask = F.crop(mask, top, left, self.size, self.size)
+            image = F.crop(image, top, left, self.height, self.width)
+            mask = F.crop(mask, top, left, self.height, self.width)
             if do_flip:
                 image, mask = F.hflip(image), F.hflip(mask)
             for operation in color_ops:
@@ -136,6 +153,7 @@ class VideoValidTransform:
         if resize_mode not in ("letterbox", "stretch"):
             raise ValueError("resize_mode must be letterbox or stretch")
         self.size = size
+        self.height, self.width = normalize_spatial_size(size)
         self.resize_mode = resize_mode
         self.ignore_index = ignore_index
 
@@ -143,8 +161,12 @@ class VideoValidTransform:
         output_images, output_masks = [], []
         for image, mask in zip(images, masks):
             if self.resize_mode == "stretch":
-                image = F.resize(image, [self.size, self.size], interpolation=InterpolationMode.BILINEAR)
-                mask = F.resize(mask, [self.size, self.size], interpolation=InterpolationMode.NEAREST)
+                image = F.resize(
+                    image, [self.height, self.width], interpolation=InterpolationMode.BILINEAR
+                )
+                mask = F.resize(
+                    mask, [self.height, self.width], interpolation=InterpolationMode.NEAREST
+                )
             else:
                 resized_w, resized_h, padding = letterbox_geometry(image.width, image.height, self.size)
                 image = F.resize(image, [resized_h, resized_w], interpolation=InterpolationMode.BILINEAR)

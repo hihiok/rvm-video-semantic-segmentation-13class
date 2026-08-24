@@ -124,6 +124,7 @@ def process_video(task):
     previous_kept = False
     segment_index = -1
     source_frames = kept_frames = dropped_frames = 0
+    source_ignore_alias_253_frames = source_ignore_alias_253_pixels = 0
 
     for image_source, mask_source in discover_pairs(vspw_root, video):
         source_frames += 1
@@ -131,6 +132,9 @@ def process_video(task):
             if mask_file.mode not in ("L", "P", "I", "I;16"):
                 raise ValueError(f"Mask must be one channel: {mask_source} ({mask_file.mode})")
             raw_mask = np.asarray(mask_file)
+        alias_pixels = int(np.count_nonzero(raw_mask == 253))
+        source_ignore_alias_253_frames += int(alias_pixels > 0)
+        source_ignore_alias_253_pixels += alias_pixels
         with Image.open(image_source) as image_file:
             image_size = image_file.size
         if raw_mask.shape != (image_size[1], image_size[0]):
@@ -173,6 +177,8 @@ def process_video(task):
         "source_frames": source_frames,
         "kept_frames": kept_frames,
         "dropped_no_target_frames": dropped_frames,
+        "source_ignore_alias_253_frames": source_ignore_alias_253_frames,
+        "source_ignore_alias_253_pixels": source_ignore_alias_253_pixels,
         "segments": len(segment_lengths),
         "segment_lengths": dict(segment_lengths),
         "pixels": dict(pixel_counts),
@@ -236,6 +242,7 @@ def build_dataset(args):
         },
         "layout": "images|annotations/<split>/<video>/segment_NNNN/<frame>",
         "copy_mode": args.copy_mode,
+        "source_ignore_aliases": {"253": args.ignore_index},
         "splits": {},
     }
     all_split_videos = {}
@@ -262,6 +269,12 @@ def build_dataset(args):
                     split_counts["source_frames"] += result["source_frames"]
                     split_counts["kept_frames"] += result["kept_frames"]
                     split_counts["dropped_no_target_frames"] += result["dropped_no_target_frames"]
+                    split_counts["source_ignore_alias_253_frames"] += result[
+                        "source_ignore_alias_253_frames"
+                    ]
+                    split_counts["source_ignore_alias_253_pixels"] += result[
+                        "source_ignore_alias_253_pixels"
+                    ]
                     segments += result["segments"]
                     videos_with_data += int(result["kept_frames"] > 0)
                     for class_id, count in result["pixels"].items():
@@ -275,6 +288,12 @@ def build_dataset(args):
             "source_frames": split_counts["source_frames"],
             "kept_frames": split_counts["kept_frames"],
             "dropped_no_target_frames": split_counts["dropped_no_target_frames"],
+            "source_ignore_alias_253_frames": split_counts[
+                "source_ignore_alias_253_frames"
+            ],
+            "source_ignore_alias_253_pixels": split_counts[
+                "source_ignore_alias_253_pixels"
+            ],
             "keep_rate": (
                 split_counts["kept_frames"] / split_counts["source_frames"]
                 if split_counts["source_frames"] else 0.0

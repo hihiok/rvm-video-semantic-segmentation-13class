@@ -63,7 +63,12 @@ def parse_args(argv=None):
     parser.add_argument("--class-names", default=",".join(DEFAULT_CLASS_NAMES))
     parser.add_argument("--ignore-index", type=int, default=255)
     parser.add_argument("--variant", choices=("mobilenetv3", "resnet50"), default="mobilenetv3")
-    parser.add_argument("--input-size", type=int, default=512)
+    parser.add_argument(
+        "--input-size", type=int, default=None,
+        help="Legacy square input; overrides --input-width and --input-height when supplied",
+    )
+    parser.add_argument("--input-width", type=int, default=640)
+    parser.add_argument("--input-height", type=int, default=360)
     parser.add_argument("--stage2-epochs", type=int, default=20)
     parser.add_argument("--stage3-epochs", type=int, default=60)
     parser.add_argument("--stage2-clip-length", type=int, default=5)
@@ -109,6 +114,10 @@ def parse_args(argv=None):
     parser.add_argument("--device", default="auto")
     args = parser.parse_args(argv)
 
+    if args.input_size is not None:
+        args.input_width = args.input_height = args.input_size
+    if args.input_width < 1 or args.input_height < 1:
+        parser.error("--input-width and --input-height must be positive")
     if bool(args.init_checkpoint) == bool(args.resume):
         parser.error("Supply exactly one of --init-checkpoint and --resume")
     if args.stage2_epochs < 0 or args.stage3_epochs < 0 or args.stage2_epochs + args.stage3_epochs < 1:
@@ -150,11 +159,13 @@ def _subset(dataset, maximum):
 
 def make_loaders(args, stage, num_classes, distributed, rank, world_size):
     train_transform = VideoTrainTransform(
-        args.input_size,
+        (args.input_height, args.input_width),
         (args.train_scale_min, args.train_scale_max),
         ignore_index=args.ignore_index,
     )
-    valid_transform = VideoValidTransform(args.input_size, args.val_resize_mode, args.ignore_index)
+    valid_transform = VideoValidTransform(
+        (args.input_height, args.input_width), args.val_resize_mode, args.ignore_index
+    )
     clip_length = stage["clip_length"]
     train_video = VideoClipDataset(
         args.data_root / args.train_images,
@@ -377,7 +388,9 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, args, class_n
         "variant": args.variant,
         "num_classes": len(class_names),
         "class_names": class_names,
-        "input_size": args.input_size,
+        "input_size": args.input_width,
+        "input_width": args.input_width,
+        "input_height": args.input_height,
         "clip_length": stage["clip_length"],
         "frame_stride": args.frame_stride,
         "video_training": True,
@@ -452,6 +465,7 @@ def main(argv=None):
         args.output_dir.mkdir(parents=True, exist_ok=True)
         print(json.dumps({
             "class_names": class_names, "device": str(device), "world_size": world_size,
+            "input_width": args.input_width, "input_height": args.input_height,
             "stage2_epochs": args.stage2_epochs, "stage3_epochs": args.stage3_epochs,
             "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
             "resume": str(args.resume) if args.resume else None,

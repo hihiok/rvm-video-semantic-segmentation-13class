@@ -4,6 +4,7 @@ from .video_semantic import (
     VideoValidTransform,
     discover_video_sequences,
     letterbox_geometry,
+    normalize_spatial_size,
 )
 from .static_semantic import (
     StaticSemanticDataset,

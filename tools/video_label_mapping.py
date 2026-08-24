@@ -6,6 +6,9 @@ from pathlib import Path
 import numpy as np
 
 
+VSPW_SOURCE_IGNORE_IDS = (253, 255)
+
+
 def normalize_name(name):
     return str(name).strip().lower()
 
@@ -41,7 +44,12 @@ def semantic_category_ids(raw_mask, panoptic):
     values = raw_mask.astype(np.int64, copy=False)
     if panoptic:
         values = np.where(values > 124, values // 100, values)
-    source_ignore = (values == 255) if not panoptic else np.zeros(values.shape, dtype=bool)
+        source_ignore = np.zeros(values.shape, dtype=bool)
+    else:
+        # The official VSPW 480p release contains 253 in 17 masks. Treat it as
+        # an undocumented void alias rather than dropping otherwise valid frames.
+        source_ignore = np.isin(values, VSPW_SOURCE_IGNORE_IDS)
+        values = np.where(source_ignore, 255, values)
     invalid = ((values < 0) | (values > 124)) & ~source_ignore
     if invalid.any():
         raise ValueError(f"Invalid source category IDs: {np.unique(values[invalid]).tolist()}")

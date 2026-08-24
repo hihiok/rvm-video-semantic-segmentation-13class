@@ -27,9 +27,10 @@ def test_filters_no_target_frames_and_splits_temporal_runs(tmp_path):
     (source / "train.txt").parent.mkdir(parents=True)
     (source / "train.txt").write_text("video_a\n", encoding="utf-8")
     # raw 1 -> sky(target 1), raw 2 -> road(non-target/background), raw 3 -> person(target 2)
-    write_source_frame(source, "video_a", "0000", np.array([[1, 2], [2, 2]]))
-    write_source_frame(source, "video_a", "0001", np.array([[0, 2], [255, 2]]))
+    write_source_frame(source, "video_a", "0000", np.array([[1, 253], [2, 2]]))
+    write_source_frame(source, "video_a", "0001", np.array([[0, 253], [255, 2]]))
     write_source_frame(source, "video_a", "0002", np.array([[3, 2], [2, 2]]))
+    write_source_frame(source, "video_a", "0003", np.array([[3, 253], [2, 2]]))
 
     categories = [
         {"id": 0, "name": "sky"}, {"id": 1, "name": "road"},
@@ -61,17 +62,23 @@ def test_filters_no_target_frames_and_splits_temporal_runs(tmp_path):
     assert kept_images == [
         Path("images/train/video_a/segment_0000/0000.jpg"),
         Path("images/train/video_a/segment_0001/0002.jpg"),
+        Path("images/train/video_a/segment_0001/0003.jpg"),
     ]
     assert not list((output / "images").rglob("0001.jpg"))
     first_mask = np.asarray(Image.open(output / "annotations/train/video_a/segment_0000/0000.png"))
     second_mask = np.asarray(Image.open(output / "annotations/train/video_a/segment_0001/0002.png"))
-    np.testing.assert_array_equal(first_mask, np.array([[1, 0], [0, 0]], dtype=np.uint8))
+    third_mask = np.asarray(Image.open(output / "annotations/train/video_a/segment_0001/0003.png"))
+    np.testing.assert_array_equal(first_mask, np.array([[1, 255], [0, 0]], dtype=np.uint8))
     np.testing.assert_array_equal(second_mask, np.array([[2, 0], [0, 0]], dtype=np.uint8))
+    np.testing.assert_array_equal(third_mask, np.array([[2, 255], [0, 0]], dtype=np.uint8))
 
     summary = json.loads((output / "dataset_summary.json").read_text())
-    assert summary["splits"]["train"]["source_frames"] == 3
-    assert summary["splits"]["train"]["kept_frames"] == 2
+    assert summary["source_ignore_aliases"] == {"253": 255}
+    assert summary["splits"]["train"]["source_frames"] == 4
+    assert summary["splits"]["train"]["kept_frames"] == 3
     assert summary["splits"]["train"]["dropped_no_target_frames"] == 1
+    assert summary["splits"]["train"]["source_ignore_alias_253_frames"] == 3
+    assert summary["splits"]["train"]["source_ignore_alias_253_pixels"] == 3
     assert summary["splits"]["train"]["segments"] == 2
     assert (output / "_SUCCESS").read_text().strip() == "complete"
     decisions = (output / "metadata/frame_filter_train.tsv").read_text()

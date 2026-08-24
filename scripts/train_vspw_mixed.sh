@@ -14,6 +14,13 @@ STAGE2_EPOCHS="${STAGE2_EPOCHS:-20}"
 STAGE3_EPOCHS="${STAGE3_EPOCHS:-60}"
 VIDEO_BATCH_SIZE="${VIDEO_BATCH_SIZE:-2}"
 STATIC_BATCH_SIZE="${STATIC_BATCH_SIZE:-8}"
+if [[ -n "${INPUT_SIZE:-}" ]]; then
+  INPUT_WIDTH="${INPUT_SIZE}"
+  INPUT_HEIGHT="${INPUT_SIZE}"
+else
+  INPUT_WIDTH="${INPUT_WIDTH:-640}"
+  INPUT_HEIGHT="${INPUT_HEIGHT:-360}"
+fi
 WORKERS="${WORKERS:-4}"
 MAX_GPUS="${MAX_GPUS:-2}"
 MIN_FREE_GPU_MIB="${MIN_FREE_GPU_MIB:-18000}"
@@ -96,7 +103,8 @@ args=(
   --batch-size "${VIDEO_BATCH_SIZE}"
   --static-batch-size "${STATIC_BATCH_SIZE}"
   --workers "${WORKERS}"
-  --input-size "${INPUT_SIZE:-512}"
+  --input-width "${INPUT_WIDTH}"
+  --input-height "${INPUT_HEIGHT}"
   --learning-rate "${LEARNING_RATE:-5e-5}"
   --backbone-learning-rate "${BACKBONE_LEARNING_RATE:-5e-6}"
   --static-validation-weight "${STATIC_VALIDATION_WEIGHT:-0.5}"
@@ -109,8 +117,9 @@ else
   args+=(--init-checkpoint "${INIT_CHECKPOINT}")
 fi
 
-printf 'VSPW_ROOT=%s\nSTATIC_ROOT=%s\nCUDA_VISIBLE_DEVICES=%s\nNPROC_PER_NODE=%s\nOUTPUT_DIR=%s\n' \
-  "${VSPW_ROOT}" "${STATIC_ROOT}" "${CUDA_VISIBLE_DEVICES}" "${NPROC_PER_NODE}" "${OUTPUT_DIR}"
+printf 'VSPW_ROOT=%s\nSTATIC_ROOT=%s\nCUDA_VISIBLE_DEVICES=%s\nNPROC_PER_NODE=%s\nOUTPUT_DIR=%s\nINPUT_RESOLUTION=%sx%s\n' \
+  "${VSPW_ROOT}" "${STATIC_ROOT}" "${CUDA_VISIBLE_DEVICES}" "${NPROC_PER_NODE}" "${OUTPUT_DIR}" \
+  "${INPUT_WIDTH}" "${INPUT_HEIGHT}"
 if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
   exec torchrun --standalone --nnodes=1 --nproc_per_node "${NPROC_PER_NODE}" \
     --master_port "${MASTER_PORT}" train_vspw_mixed.py "${args[@]}"

@@ -35,7 +35,7 @@ from semantic_utils import (
 )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--train-images", default="images/train")
@@ -45,7 +45,12 @@ def parse_args():
     parser.add_argument("--class-names", default=",".join(DEFAULT_CLASS_NAMES))
     parser.add_argument("--ignore-index", type=int, default=255)
     parser.add_argument("--variant", choices=["mobilenetv3", "resnet50"], default="mobilenetv3")
-    parser.add_argument("--input-size", type=int, default=512)
+    parser.add_argument(
+        "--input-size", type=int, default=None,
+        help="Legacy square input; overrides --input-width and --input-height when supplied",
+    )
+    parser.add_argument("--input-width", type=int, default=640)
+    parser.add_argument("--input-height", type=int, default=360)
     parser.add_argument("--clip-length", type=int, default=5)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--train-clip-step", type=int, default=5)
@@ -83,7 +88,11 @@ def parse_args():
     parser.add_argument("--sync-bn", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--device", default="auto")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.input_size is not None:
+        args.input_width = args.input_height = args.input_size
+    if args.input_width < 1 or args.input_height < 1:
+        parser.error("--input-width and --input-height must be positive")
     if args.resume and args.init_checkpoint:
         parser.error("--resume and --init-checkpoint are mutually exclusive")
     if args.gradient_accumulation < 1:
@@ -128,7 +137,7 @@ def make_dataloaders(args, num_classes, distributed, rank, world_size):
         frame_stride=args.frame_stride,
         clip_step=args.train_clip_step,
         transform=VideoTrainTransform(
-            args.input_size,
+            (args.input_height, args.input_width),
             (args.train_scale_min, args.train_scale_max),
             ignore_index=args.ignore_index,
         ),
@@ -144,7 +153,9 @@ def make_dataloaders(args, num_classes, distributed, rank, world_size):
         clip_length=args.clip_length,
         frame_stride=args.frame_stride,
         clip_step=val_step,
-        transform=VideoValidTransform(args.input_size, args.val_resize_mode, args.ignore_index),
+        transform=VideoValidTransform(
+            (args.input_height, args.input_width), args.val_resize_mode, args.ignore_index
+        ),
         ignore_index=args.ignore_index,
     )
     if args.max_train_clips > 0:
@@ -297,7 +308,9 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, best_miou, ar
         "variant": args.variant,
         "num_classes": len(class_names),
         "class_names": class_names,
-        "input_size": args.input_size,
+        "input_size": args.input_width,
+        "input_width": args.input_width,
+        "input_height": args.input_height,
         "clip_length": args.clip_length,
         "frame_stride": args.frame_stride,
         "video_training": True,
@@ -318,6 +331,7 @@ def main():
     if rank == 0:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         print(f"Classes: {dict(enumerate(class_names))}")
+        print(f"Network input: {args.input_width}x{args.input_height} (width x height)")
         print(f"Video clips: T={args.clip_length}, stride={args.frame_stride}; device={device}; world_size={world_size}")
     train_loader, val_loader, train_sampler = make_dataloaders(args, len(class_names), distributed, rank, world_size)
     model, optimizer, scheduler, scaler = build_model_and_optimizer(args, class_names, device, distributed)
