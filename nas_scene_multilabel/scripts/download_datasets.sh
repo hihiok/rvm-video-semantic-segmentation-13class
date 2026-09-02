@@ -23,14 +23,11 @@ if [[ ! -f .filelist_downloaded ]]; then
   touch .filelist_downloaded
 fi
 
-if [[ ! -d data_256 ]]; then
-  tar -xf train_256_places365standard.tar
-fi
-if [[ ! -d val_256 ]]; then
-  mkdir -p val_256
-  tar -xf val_256.tar -C val_256
-fi
-if [[ ! -f places365_val.txt ]]; then
+[[ -d data_256 ]] || tar -xf train_256_places365standard.tar
+[[ -d val_256 ]] || tar -xf val_256.tar
+# The file-list archive may unpack metadata into a subdirectory; the Python
+# builder searches recursively, so no relocation is needed.
+if ! find . -type f -name places365_val.txt -print -quit | grep -q .; then
   tar -xf filelist_places365-standard.tar
 fi
 
