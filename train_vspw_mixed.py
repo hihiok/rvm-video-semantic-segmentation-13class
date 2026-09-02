@@ -33,6 +33,7 @@ from semantic_utils import (
     seed_everything,
     seed_worker,
     semantic_loss,
+    causal_temporal_consistency_loss,
     torch_load,
     unwrap_model,
 )
@@ -75,6 +76,22 @@ def parse_args(argv=None):
     parser.add_argument("--stage2-static-batches", type=int, default=1)
     parser.add_argument("--stage3-video-batches", type=int, default=2)
     parser.add_argument("--stage3-static-batches", type=int, default=1)
+    parser.add_argument(
+        "--stage2-trainable-scope",
+        choices=("recurrent", "recurrent_head", "decoder", "all"),
+        default="all",
+        help="Trainable modules during stage 2; recurrent freezes every spatial module and BN statistic.",
+    )
+    parser.add_argument(
+        "--stage3-trainable-scope",
+        choices=("recurrent", "recurrent_head", "decoder", "all"),
+        default="all",
+        help="Trainable modules during stage 3. Distributed runs require the same scope in both stages.",
+    )
+    parser.add_argument("--stage2-temporal-weight", type=float, default=0.0)
+    parser.add_argument("--stage3-temporal-weight", type=float, default=0.0)
+    parser.add_argument("--temporal-boundary-radius", type=int, default=2)
+    parser.add_argument("--temporal-temperature", type=float, default=1.0)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument(
         "--max-frame-gap", type=int, default=1,
@@ -106,6 +123,12 @@ def parse_args(argv=None):
     parser.add_argument("--clip-grad-norm", type=float, default=5.0)
     parser.add_argument("--static-validation-weight", type=float, default=0.5)
     parser.add_argument("--static-retention-tolerance", type=float, default=0.03)
+    parser.add_argument(
+        "--prediction-flip-penalty",
+        type=float,
+        default=0.1,
+        help="Constrained checkpoint score = video_mIoU - penalty * prediction flip rate.",
+    )
     parser.add_argument("--baseline-validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--print-every", type=int, default=20)
@@ -133,6 +156,14 @@ def parse_args(argv=None):
         parser.error("--input-width and --input-height must form an exact positive 16:9 ratio")
     if args.max_frame_gap < 0:
         parser.error("--max-frame-gap cannot be negative")
+    if args.stage2_temporal_weight < 0 or args.stage3_temporal_weight < 0:
+        parser.error("Temporal loss weights cannot be negative")
+    if args.temporal_boundary_radius < 0:
+        parser.error("--temporal-boundary-radius cannot be negative")
+    if args.temporal_temperature <= 0:
+        parser.error("--temporal-temperature must be positive")
+    if args.prediction_flip_penalty < 0:
+        parser.error("--prediction-flip-penalty cannot be negative")
     # Keep legacy checkpoint consumers compatible while explicitly recording both dimensions.
     args.input_size = args.input_width
     args.epochs = args.stage2_epochs + args.stage3_epochs
@@ -146,13 +177,60 @@ def stage_for_epoch(args, epoch):
             "clip_length": args.stage2_clip_length,
             "video_batches": args.stage2_video_batches,
             "static_batches": args.stage2_static_batches,
+            "trainable_scope": getattr(args, "stage2_trainable_scope", "all"),
+            "temporal_weight": getattr(args, "stage2_temporal_weight", 0.0),
         }
     return {
         "name": "stage3_temporal_finetuning",
         "clip_length": args.stage3_clip_length,
         "video_batches": args.stage3_video_batches,
         "static_batches": args.stage3_static_batches,
+        "trainable_scope": getattr(args, "stage3_trainable_scope", "all"),
+        "temporal_weight": getattr(args, "stage3_temporal_weight", 0.0),
     }
+
+
+def configure_trainable_scope(model, scope):
+    """Freeze spatial weights while allowing selected recurrent/semantic modules to learn."""
+    module = unwrap_model(model)
+    if scope not in ("recurrent", "recurrent_head", "decoder", "all"):
+        raise ValueError(f"Unknown trainable scope: {scope}")
+
+    trainable = []
+    for name, parameter in module.named_parameters():
+        is_recurrent = ".gru." in name
+        if scope == "recurrent":
+            enabled = is_recurrent
+        elif scope == "recurrent_head":
+            enabled = is_recurrent or name.startswith("project_seg.")
+        elif scope == "decoder":
+            enabled = not name.startswith("backbone.")
+        else:
+            enabled = True
+        parameter.requires_grad_(enabled)
+        if enabled:
+            trainable.append(name)
+    if not trainable:
+        raise RuntimeError(f"Trainable scope {scope!r} selected no parameters")
+    return trainable
+
+
+def set_training_mode_for_scope(model, scope):
+    """Keep BatchNorm statistics frozen whenever its spatial block is frozen."""
+    model.train()
+    module = unwrap_model(model)
+    if scope in ("recurrent", "recurrent_head"):
+        module.backbone.eval()
+        module.aspp.eval()
+        module.decoder.eval()
+        module.project_seg.eval()
+        for name, child in module.decoder.named_modules():
+            if name.endswith("gru"):
+                child.train()
+        if scope == "recurrent_head":
+            module.project_seg.train()
+    elif scope == "decoder":
+        module.backbone.eval()
 
 
 def _subset(dataset, maximum):
@@ -306,14 +384,22 @@ def _infinite_batches(loader):
 
 
 def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, stage, weights, rank):
-    model.train()
+    set_training_mode_for_scope(model, stage["trainable_scope"])
     optimizer.zero_grad(set_to_none=True)
     video_iter = iter(loaders["video_train"])
     static_iter = _infinite_batches(loaders["static_train"])
     sources = list(mixed_batch_sources(
         len(loaders["video_train"]), stage["video_batches"], stage["static_batches"]
     ))
-    totals = {"video_loss": 0.0, "video_samples": 0, "static_loss": 0.0, "static_samples": 0}
+    totals = {
+        "video_loss": 0.0,
+        "video_semantic_loss": 0.0,
+        "video_temporal_loss": 0.0,
+        "video_temporal_pixels": 0.0,
+        "video_samples": 0,
+        "static_loss": 0.0,
+        "static_samples": 0,
+    }
     progress = tqdm(sources, disable=rank != 0, dynamic_ncols=True, desc=f"Mixed {epoch:03d}")
     for index, source in enumerate(progress):
         images, masks = next(video_iter if source == "video" else static_iter)
@@ -325,8 +411,19 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
                 logits, masks, logits.shape[2], weights, args.ignore_index,
                 args.ce_weight, args.dice_weight,
             )
+            temporal_loss = logits.sum() * 0.0
+            temporal_pixels = 0
+            if source == "video" and stage["temporal_weight"] > 0:
+                temporal_loss, temporal_pixels = causal_temporal_consistency_loss(
+                    logits,
+                    masks,
+                    ignore_index=args.ignore_index,
+                    boundary_radius=args.temporal_boundary_radius,
+                    temperature=args.temporal_temperature,
+                )
             domain_weight = args.video_loss_weight if source == "video" else args.static_loss_weight
-            loss = losses["total"] * domain_weight / args.gradient_accumulation
+            objective = losses["total"] + stage["temporal_weight"] * temporal_loss
+            loss = objective * domain_weight / args.gradient_accumulation
         scaler.scale(loss).backward()
         if (index + 1) % args.gradient_accumulation == 0 or index + 1 == len(sources):
             if args.clip_grad_norm > 0:
@@ -337,8 +434,12 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
             optimizer.zero_grad(set_to_none=True)
 
         count = images.shape[0]
-        totals[f"{source}_loss"] += losses["total"].detach().item() * count
+        totals[f"{source}_loss"] += objective.detach().item() * count
         totals[f"{source}_samples"] += count
+        if source == "video":
+            totals["video_semantic_loss"] += losses["total"].detach().item() * count
+            totals["video_temporal_loss"] += temporal_loss.detach().item() * count
+            totals["video_temporal_pixels"] += temporal_pixels
         if rank == 0 and (index + 1) % args.print_every == 0:
             progress.set_postfix(
                 video=f"{totals['video_loss'] / max(totals['video_samples'], 1):.4f}",
@@ -351,6 +452,9 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
     totals = dict(zip(totals, values.tolist()))
     return {
         "video_train_loss": totals["video_loss"] / max(totals["video_samples"], 1),
+        "video_semantic_loss": totals["video_semantic_loss"] / max(totals["video_samples"], 1),
+        "video_temporal_loss": totals["video_temporal_loss"] / max(totals["video_samples"], 1),
+        "video_temporal_pixels": int(totals["video_temporal_pixels"]),
         "static_train_loss": totals["static_loss"] / max(totals["static_samples"], 1),
         "video_train_samples": int(totals["video_samples"]),
         "static_train_samples": int(totals["static_samples"]),
@@ -390,7 +494,11 @@ def validate_domain(model, loader, device, args, class_names, weights, rank, dom
     metrics = matrix.compute(class_names)
     metrics["loss"] = float(totals[0] / totals[1].clamp_min(1))
     if domain == "video":
-        metrics["stable_gt_flip_rate"] = float(totals[2] / totals[3].clamp_min(1))
+        flip_rate = float(totals[2] / totals[3].clamp_min(1))
+        # Backward-compatible key plus an unambiguous name: this is the model's
+        # prediction flip rate, measured only where adjacent GT labels are stable.
+        metrics["stable_gt_flip_rate"] = flip_rate
+        metrics["prediction_flip_rate_on_stable_gt"] = flip_rate
         metrics["stable_gt_pixels"] = int(totals[3])
     return metrics
 
@@ -412,6 +520,7 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, args, class_n
         "best_video_miou": records["best_video"],
         "best_static_miou": records["best_static"],
         "best_balanced_score": records["best_balanced"],
+        "best_spatial_preserved_score": records.get("best_spatial_preserved", -1.0),
         "variant": args.variant,
         "num_classes": len(class_names),
         "class_names": class_names,
@@ -443,6 +552,7 @@ def load_resume(path, model, optimizer, scheduler, scaler, class_names):
         "best_video": float(checkpoint.get("best_video_miou", -1.0)),
         "best_static": float(checkpoint.get("best_static_miou", -1.0)),
         "best_balanced": float(checkpoint.get("best_balanced_score", -1.0)),
+        "best_spatial_preserved": float(checkpoint.get("best_spatial_preserved_score", -1.0)),
     }
     return int(checkpoint["epoch"]) + 1, records, checkpoint.get("baseline_metrics")
 
@@ -485,6 +595,11 @@ def main(argv=None):
     if class_names != DEFAULT_CLASS_NAMES:
         raise ValueError(f"This workflow requires the fixed 13-class mapping: {DEFAULT_CLASS_NAMES}")
     distributed, rank, world_size, local_rank, device = distributed_info(args)
+    if distributed and args.stage2_trainable_scope != args.stage3_trainable_scope:
+        raise ValueError(
+            "DistributedDataParallel cannot change the trainable parameter set after wrapping. "
+            "Use the same stage2/stage3 trainable scope, or run a separate follow-up job."
+        )
     seed_everything(args.seed, rank)
     weights = parse_class_weights(args.class_weights, len(class_names))
     if weights is not None:
@@ -504,12 +619,32 @@ def main(argv=None):
         compatibility = verify_stage1_checkpoint(args.init_checkpoint, model, class_names)
         if rank == 0:
             print(json.dumps({"stage1_checkpoint_verification": compatibility}, indent=2))
-    records = {"best_video": -1.0, "best_static": -1.0, "best_balanced": -1.0}
+    records = {
+        "best_video": -1.0,
+        "best_static": -1.0,
+        "best_balanced": -1.0,
+        "best_spatial_preserved": -1.0,
+    }
     start_epoch, baseline = 0, None
     if args.resume:
         start_epoch, records, baseline = load_resume(
             args.resume, model, optimizer, scheduler, scaler, class_names
         )
+    initial_trainable = configure_trainable_scope(
+        model, stage_for_epoch(args, min(start_epoch, args.epochs - 1))["trainable_scope"]
+    )
+    if rank == 0:
+        total_parameters = sum(parameter.numel() for parameter in model.parameters())
+        trainable_parameters = sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        )
+        print(json.dumps({
+            "trainable_scope": stage_for_epoch(args, min(start_epoch, args.epochs - 1))["trainable_scope"],
+            "trainable_parameter_tensors": len(initial_trainable),
+            "trainable_parameters": trainable_parameters,
+            "total_parameters": total_parameters,
+            "trainable_ratio": trainable_parameters / max(total_parameters, 1),
+        }, indent=2))
     if distributed:
         model = DistributedDataParallel(
             model, device_ids=[local_rank] if device.type == "cuda" else None,
@@ -535,6 +670,11 @@ def main(argv=None):
             )
             print(f"Baseline VSPW: {format_metrics(baseline['video'])}")
             print(f"Baseline COCO+ADE: {format_metrics(baseline['static'])}")
+            if not args.resume:
+                baseline_payload = checkpoint_payload(
+                    model, optimizer, scheduler, scaler, -1, args, class_names, records, baseline
+                )
+                atomic_torch_save(baseline_payload, args.output_dir / "baseline_stage1.pth")
     if args.evaluate_only:
         if distributed:
             dist.destroy_process_group()
@@ -542,6 +682,7 @@ def main(argv=None):
 
     for epoch in range(start_epoch, args.epochs):
         stage = stage_for_epoch(args, epoch)
+        configure_trainable_scope(model, stage["trainable_scope"])
         if stage["name"] != active_stage:
             loaders, video_sampler, static_sampler = make_loaders(
                 args, stage, len(class_names), distributed, rank, world_size
@@ -568,6 +709,13 @@ def main(argv=None):
             baseline["static"]["miou"] - args.static_retention_tolerance if baseline else float("-inf")
         )
         retained = static_metrics["miou"] >= static_floor
+        video_improved_over_baseline = (
+            not baseline or video_metrics["miou"] >= baseline["video"]["miou"]
+        )
+        prediction_flip_rate = video_metrics["prediction_flip_rate_on_stable_gt"]
+        spatial_preserved_score = (
+            video_metrics["miou"] - args.prediction_flip_penalty * prediction_flip_rate
+        )
 
         if rank == 0:
             print(
@@ -577,7 +725,8 @@ def main(argv=None):
                 f"video_mIoU={video_metrics['miou']:.4f}, "
                 f"static_mIoU={static_metrics['miou']:.4f}, "
                 f"balanced={score:.4f}, retained={retained}, "
-                f"stable_gt_flip_rate={video_metrics['stable_gt_flip_rate']:.6f}, "
+                f"prediction_flip_rate_on_stable_gt={prediction_flip_rate:.6f}, "
+                f"scope={stage['trainable_scope']}, temporal_weight={stage['temporal_weight']:.4f}, "
                 f"time={time.time() - started:.1f}s"
             )
             append_metrics_csv(args.output_dir / "metrics.csv", {
@@ -589,15 +738,24 @@ def main(argv=None):
                 "balanced_score": score,
                 "static_retained": retained,
                 "static_floor": static_floor,
+                "video_improved_over_baseline": video_improved_over_baseline,
+                "spatial_preserved_score": spatial_preserved_score,
             })
 
             improved_video = video_metrics["miou"] > records["best_video"]
             improved_static = static_metrics["miou"] > records["best_static"]
             improved_balanced = score > records["best_balanced"] and retained
+            improved_spatial_preserved = (
+                retained
+                and video_improved_over_baseline
+                and spatial_preserved_score > records["best_spatial_preserved"]
+            )
             records["best_video"] = max(records["best_video"], video_metrics["miou"])
             records["best_static"] = max(records["best_static"], static_metrics["miou"])
             if improved_balanced:
                 records["best_balanced"] = score
+            if improved_spatial_preserved:
+                records["best_spatial_preserved"] = spatial_preserved_score
             payload = checkpoint_payload(
                 model, optimizer, scheduler, scaler, epoch, args, class_names, records, baseline
             )
@@ -609,6 +767,8 @@ def main(argv=None):
             if improved_balanced:
                 atomic_torch_save(payload, args.output_dir / "best_balanced.pth")
                 atomic_torch_save(payload, args.output_dir / "best_miou.pth")
+            if improved_spatial_preserved:
+                atomic_torch_save(payload, args.output_dir / "best_spatial_preserved.pth")
             if (epoch + 1) % args.save_every == 0:
                 atomic_torch_save(payload, args.output_dir / f"epoch_{epoch:03d}.pth")
             if not retained:

@@ -4,3 +4,4 @@ from .segmentation import (
     RVMForVideoSemanticSegmentation,
     load_compatible_weights,
 )
+from .semantic_guided_filter import MultiClassFastGuidedFilterRefiner

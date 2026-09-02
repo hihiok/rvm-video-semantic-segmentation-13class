@@ -3,15 +3,17 @@
 
 import argparse
 import json
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+from torch.nn import functional as F
 from tqdm import tqdm
 
-from model import RVMForVideoSemanticSegmentation
+from model import MultiClassFastGuidedFilterRefiner, RVMForVideoSemanticSegmentation
 from semantic_utils import DEFAULT_CLASS_NAMES, DEFAULT_PALETTE, torch_load
 
 
@@ -29,6 +31,14 @@ def parse_args():
     parser.add_argument("--input-height", type=int, default=None)
     parser.add_argument("--resize-mode", choices=["letterbox", "stretch"], default="letterbox")
     parser.add_argument("--overlay-alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--upsample-mode",
+        choices=("mask_nearest", "bilinear", "guided"),
+        default="mask_nearest",
+        help="Restore model output to source resolution; mask_nearest preserves legacy behavior.",
+    )
+    parser.add_argument("--guided-radius", type=int, default=1)
+    parser.add_argument("--guided-eps", type=float, default=1e-4)
     parser.add_argument("--recurrent", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--scene-cut-threshold",
@@ -106,6 +116,48 @@ def restore_mask(mask, original_width, original_height, geometry):
     return cv2.resize(mask, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
 
 
+def crop_model_padding(tensor, geometry):
+    if geometry is None:
+        return tensor
+    resized_w, resized_h, padding = geometry
+    left, top, _, _ = padding
+    return tensor[..., top : top + resized_h, left : left + resized_w]
+
+
+def frame_rgb_tensor(frame_bgr, device, dtype=torch.float32):
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    return (
+        torch.from_numpy(np.ascontiguousarray(rgb))
+        .permute(2, 0, 1)
+        .to(device=device, dtype=dtype)
+        .div_(255)
+        .unsqueeze(0)
+    )
+
+
+def restore_logits(
+    logits,
+    base_rgb,
+    frame_bgr,
+    geometry,
+    mode,
+    guided_refiner=None,
+):
+    """Restore class logits before argmax so competing classes remain available."""
+    logits = crop_model_padding(logits, geometry)
+    base_rgb = crop_model_padding(base_rgb, geometry)
+    output_size = frame_bgr.shape[:2]
+    if mode == "bilinear":
+        return F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
+    if mode != "guided" or guided_refiner is None:
+        raise ValueError(f"Unsupported logit restoration mode: {mode}")
+    fine_rgb = frame_rgb_tensor(frame_bgr, logits.device, logits.dtype)
+    # The guided filter is numerically safer in FP32 even when the network uses AMP.
+    return guided_refiner(
+        base_rgb.float(), logits.float(), fine_rgb.float()
+    ).to(logits.dtype)
+
+
 def colorize(mask):
     palette = np.asarray(DEFAULT_PALETTE, dtype=np.uint8)
     return palette[mask]
@@ -139,7 +191,7 @@ def amp_context(enabled):
 
 
 @torch.inference_mode()
-def process_video(video_path, relative_path, args, model, class_names, input_size):
+def process_video(video_path, relative_path, args, model, class_names, input_size, guided_refiner=None):
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -162,6 +214,8 @@ def process_video(video_path, relative_path, args, model, class_names, input_siz
     previous_gray = None
     frame_index = 0
     reset_count = 0
+    network_seconds = 0.0
+    upsample_seconds = 0.0
     progress = tqdm(total=frame_total if frame_total > 0 else None, desc=video_path.name, dynamic_ncols=True)
     try:
         while True:
@@ -181,11 +235,27 @@ def process_video(video_path, relative_path, args, model, class_names, input_siz
 
             tensor, geometry = prepare_frame(frame, input_size, args.resize_mode)
             tensor = tensor.to(args.device, non_blocking=True)
+            if tensor.is_cuda:
+                torch.cuda.synchronize(tensor.device)
+            network_started = time.perf_counter()
             with amp_context(args.amp and str(args.device).startswith("cuda")):
                 logits, *new_recurrence = model(tensor, *recurrence)
+            if tensor.is_cuda:
+                torch.cuda.synchronize(tensor.device)
+            network_seconds += time.perf_counter() - network_started
             recurrence = new_recurrence if args.recurrent else [None] * 4
-            mask = logits.argmax(dim=1)[0].byte().cpu().numpy()
-            mask = restore_mask(mask, width, height, geometry)
+            upsample_started = time.perf_counter()
+            if args.upsample_mode == "mask_nearest":
+                mask = logits.argmax(dim=1)[0].byte().cpu().numpy()
+                mask = restore_mask(mask, width, height, geometry)
+            else:
+                restored_logits = restore_logits(
+                    logits, tensor, frame, geometry, args.upsample_mode, guided_refiner
+                )
+                mask = restored_logits.argmax(dim=1)[0].byte().cpu().numpy()
+            if tensor.is_cuda:
+                torch.cuda.synchronize(tensor.device)
+            upsample_seconds += time.perf_counter() - upsample_started
             color_rgb = colorize(mask)
             color_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
             overlay = cv2.addWeighted(frame, 1 - args.overlay_alpha, color_bgr, args.overlay_alpha, 0)
@@ -211,13 +281,24 @@ def process_video(video_path, relative_path, args, model, class_names, input_siz
         stats_file.close()
         writer.release()
         capture.release()
-    print(f"Saved {frame_index} frames, {reset_count} state resets: {output_path}")
+    summary = {
+        "frames": frame_index,
+        "state_resets": reset_count,
+        "upsample_mode": args.upsample_mode,
+        "network_ms_per_frame": 1000.0 * network_seconds / max(frame_index, 1),
+        "upsample_ms_per_frame": 1000.0 * upsample_seconds / max(frame_index, 1),
+        "output": str(output_path),
+    }
+    output_path.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
 
 
 def main():
     args = parse_args()
     if not 0 <= args.overlay_alpha <= 1:
         raise ValueError("--overlay-alpha must be in [0,1]")
+    if args.guided_radius < 1 or args.guided_eps <= 0:
+        raise ValueError("Guided radius must be >=1 and epsilon must be positive")
     checkpoint = torch_load(args.checkpoint, "cpu")
     class_names = list(checkpoint.get("class_names", DEFAULT_CLASS_NAMES))
     if class_names != DEFAULT_CLASS_NAMES:
@@ -227,13 +308,18 @@ def main():
     model = RVMForVideoSemanticSegmentation(checkpoint.get("variant", "mobilenetv3"), len(class_names))
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval().to(args.device)
+    guided_refiner = None
+    if args.upsample_mode == "guided":
+        guided_refiner = MultiClassFastGuidedFilterRefiner(
+            args.guided_radius, args.guided_eps
+        ).eval().to(args.device)
     videos = find_videos(args.input)
     if not videos:
         raise RuntimeError(f"No video files found: {args.input}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for video in videos:
         relative = Path(video.name) if args.input.is_file() else video.relative_to(args.input)
-        process_video(video, relative, args, model, class_names, input_size)
+        process_video(video, relative, args, model, class_names, input_size, guided_refiner)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,10 @@ from dataset import (
 )
 from dataset.video_semantic import VideoSequence
 from train_vspw_mixed import balanced_score, mixed_batch_sources, parse_args, stage_for_epoch
+from train_vspw_mixed import configure_trainable_scope
+from model import MultiClassFastGuidedFilterRefiner, RVMForVideoSemanticSegmentation
+from semantic_utils import causal_temporal_consistency_loss
+from inference_video_semantic import scene_cut_score
 
 
 def make_split(root, split, values=(1, 12)):
@@ -119,3 +123,71 @@ def test_stage_transition_increases_clip_length_and_video_ratio(tmp_path):
 
 def test_balanced_score_uses_both_validation_domains():
     assert balanced_score({"miou": 0.8}, {"miou": 0.6}, 0.5) == pytest.approx(0.7)
+
+
+def test_temporal_consistency_is_zero_for_identical_predictions():
+    logits = torch.randn(1, 3, 4, 8, 8)
+    logits[:, 1:] = logits[:, :1]
+    target = torch.ones(1, 3, 8, 8, dtype=torch.long)
+    loss, pixels = causal_temporal_consistency_loss(
+        logits, target, boundary_radius=0
+    )
+    assert pixels == 2 * 8 * 8
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_temporal_consistency_penalizes_flips_only_on_stable_gt():
+    logits = torch.full((1, 2, 3, 6, 6), -4.0)
+    logits[:, 0, 0] = 4.0
+    logits[:, 1, 1] = 4.0
+    target = torch.zeros(1, 2, 6, 6, dtype=torch.long)
+    loss, pixels = causal_temporal_consistency_loss(
+        logits, target, boundary_radius=0
+    )
+    assert pixels == 36
+    assert loss.item() > 1.0
+
+
+def test_recurrent_scope_freezes_spatial_parameters():
+    model = RVMForVideoSemanticSegmentation("mobilenetv3", 13)
+    trainable = configure_trainable_scope(model, "recurrent")
+    assert trainable
+    assert all(".gru." in name for name in trainable)
+    assert all(
+        parameter.requires_grad == (".gru." in name)
+        for name, parameter in model.named_parameters()
+    )
+
+
+def test_multiclass_guided_filter_supports_arbitrary_class_count():
+    refiner = MultiClassFastGuidedFilterRefiner(radius=1, eps=1e-4)
+    base_rgb = torch.rand(2, 3, 8, 12)
+    base_logits = torch.rand(2, 13, 8, 12)
+    fine_rgb = torch.rand(2, 3, 16, 24)
+    output = refiner(base_rgb, base_logits, fine_rgb)
+    assert output.shape == (2, 13, 16, 24)
+    assert torch.isfinite(output).all()
+
+
+def test_temporal_preserve_arguments_are_recorded_per_stage(tmp_path):
+    args = parse_args([
+        "--data-root", str(tmp_path / "vspw"),
+        "--static-root", str(tmp_path / "static"),
+        "--init-checkpoint", str(tmp_path / "initial.pth"),
+        "--stage2-trainable-scope", "recurrent",
+        "--stage3-trainable-scope", "recurrent",
+        "--stage2-temporal-weight", "0.05",
+        "--stage3-temporal-weight", "0.10",
+    ])
+    assert stage_for_epoch(args, 0)["trainable_scope"] == "recurrent"
+    assert stage_for_epoch(args, 0)["temporal_weight"] == pytest.approx(0.05)
+    assert stage_for_epoch(args, args.stage2_epochs)["temporal_weight"] == pytest.approx(0.10)
+
+
+def test_scene_cut_score_detects_abrupt_full_frame_change():
+    black = np.zeros((32, 48, 3), dtype=np.uint8)
+    white = np.full((32, 48, 3), 255, dtype=np.uint8)
+    first_score, previous = scene_cut_score(None, black)
+    second_score, _ = scene_cut_score(previous, white)
+    assert first_score is None
+    assert second_score == pytest.approx(1.0)

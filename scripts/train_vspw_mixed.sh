@@ -93,6 +93,12 @@ args=(
   --stage2-static-batches "${STAGE2_STATIC_BATCHES:-1}"
   --stage3-video-batches "${STAGE3_VIDEO_BATCHES:-2}"
   --stage3-static-batches "${STAGE3_STATIC_BATCHES:-1}"
+  --stage2-trainable-scope "${STAGE2_TRAINABLE_SCOPE:-all}"
+  --stage3-trainable-scope "${STAGE3_TRAINABLE_SCOPE:-all}"
+  --stage2-temporal-weight "${STAGE2_TEMPORAL_WEIGHT:-0.0}"
+  --stage3-temporal-weight "${STAGE3_TEMPORAL_WEIGHT:-0.0}"
+  --temporal-boundary-radius "${TEMPORAL_BOUNDARY_RADIUS:-2}"
+  --temporal-temperature "${TEMPORAL_TEMPERATURE:-1.0}"
   --batch-size "${VIDEO_BATCH_SIZE}"
   --static-batch-size "${STATIC_BATCH_SIZE}"
   --workers "${WORKERS}"
@@ -103,8 +109,12 @@ args=(
   --backbone-learning-rate "${BACKBONE_LEARNING_RATE:-5e-6}"
   --static-validation-weight "${STATIC_VALIDATION_WEIGHT:-0.5}"
   --static-retention-tolerance "${STATIC_RETENTION_TOLERANCE:-0.03}"
+  --prediction-flip-penalty "${PREDICTION_FLIP_PENALTY:-0.1}"
   --save-every "${SAVE_EVERY:-10}"
 )
+if [[ -n "${CLASS_WEIGHTS:-}" ]]; then
+  args+=(--class-weights "${CLASS_WEIGHTS}")
+fi
 if [[ -n "${RESUME:-}" ]]; then
   args+=(--resume "${RESUME}")
 else

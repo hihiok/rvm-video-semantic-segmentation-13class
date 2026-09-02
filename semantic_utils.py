@@ -130,6 +130,89 @@ def semantic_loss(
     return {"total": ce_weight * ce + dice_weight * dice, "cross_entropy": ce, "dice": dice}
 
 
+def semantic_boundary_mask(target: Tensor, ignore_index: int = 255, radius: int = 1):
+    """Return pixels at, or close to, a valid semantic-label boundary."""
+    if target.ndim not in (3, 4):
+        raise ValueError(f"Expected [B,H,W] or [B,T,H,W], got {target.shape}")
+    if radius < 0:
+        raise ValueError("radius must be nonnegative")
+    original_shape = target.shape
+    flat = target.flatten(0, 1) if target.ndim == 4 else target
+    valid = flat.ne(ignore_index)
+    boundary = torch.zeros_like(valid)
+
+    horizontal = (
+        valid[:, :, 1:]
+        & valid[:, :, :-1]
+        & flat[:, :, 1:].ne(flat[:, :, :-1])
+    )
+    boundary[:, :, 1:] |= horizontal
+    boundary[:, :, :-1] |= horizontal
+    vertical = (
+        valid[:, 1:, :]
+        & valid[:, :-1, :]
+        & flat[:, 1:, :].ne(flat[:, :-1, :])
+    )
+    boundary[:, 1:, :] |= vertical
+    boundary[:, :-1, :] |= vertical
+
+    if radius:
+        kernel = radius * 2 + 1
+        boundary = F.max_pool2d(
+            boundary.unsqueeze(1).float(), kernel_size=kernel, stride=1, padding=radius
+        ).squeeze(1).bool()
+    if target.ndim == 4:
+        boundary = boundary.unflatten(0, original_shape[:2])
+    return boundary
+
+
+def causal_temporal_consistency_loss(
+    logits: Tensor,
+    target: Tensor,
+    ignore_index: int = 255,
+    boundary_radius: int = 2,
+    temperature: float = 1.0,
+):
+    """
+    Match the current prediction to the detached previous prediction only where
+    consecutive ground-truth labels are unchanged and away from boundaries.
+
+    The stable-GT mask avoids penalizing genuine motion or semantic changes. The
+    causal, detached previous distribution also matches recurrent inference.
+    """
+    if logits.ndim != 5 or target.ndim != 4:
+        raise ValueError(
+            f"Expected logits [B,T,C,H,W] and target [B,T,H,W], got "
+            f"{logits.shape} and {target.shape}"
+        )
+    if logits.shape[:2] != target.shape[:2] or logits.shape[-2:] != target.shape[-2:]:
+        raise ValueError(f"Temporal logits/target mismatch: {logits.shape}, {target.shape}")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if logits.shape[1] < 2:
+        return logits.sum() * 0.0, 0
+
+    boundary = semantic_boundary_mask(target, ignore_index, boundary_radius)
+    stable = (
+        target[:, 1:].ne(ignore_index)
+        & target[:, :-1].ne(ignore_index)
+        & target[:, 1:].eq(target[:, :-1])
+        & ~boundary[:, 1:]
+        & ~boundary[:, :-1]
+    )
+    stable_count = int(stable.sum().detach().item())
+    if stable_count == 0:
+        return logits.sum() * 0.0, 0
+
+    previous_probability = (logits[:, :-1].detach() / temperature).softmax(dim=2)
+    current_log_probability = (logits[:, 1:] / temperature).log_softmax(dim=2)
+    pixel_kl = F.kl_div(
+        current_log_probability, previous_probability, reduction="none"
+    ).sum(dim=2)
+    loss = pixel_kl.masked_select(stable).mean() * (temperature ** 2)
+    return loss, stable_count
+
+
 class ConfusionMatrix:
     def __init__(self, num_classes: int, device):
         self.num_classes = num_classes
