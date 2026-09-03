@@ -6,10 +6,89 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .decoder import Projection, RecurrentDecoder
+from .decoder import ConvGRU, Projection, RecurrentDecoder
 from .lraspp import LRASPP
 from .mobilenetv3 import MobileNetV3LargeEncoder
 from .resnet import ResNet50Encoder
+
+
+class TemporalResidualAdapter(nn.Module):
+    """Causal, low-resolution ConvGRU that predicts a residual over frozen logits."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        hidden_channels: int = 16,
+        scale: float = 0.25,
+    ):
+        super().__init__()
+        if hidden_channels < 1:
+            raise ValueError("hidden_channels must be positive")
+        if not 0 < scale <= 1:
+            raise ValueError("scale must be in (0, 1]")
+        self.num_classes = num_classes
+        self.hidden_channels = hidden_channels
+        self.scale = scale
+        self.input_projection = nn.Sequential(
+            nn.Conv2d(num_classes + 3, hidden_channels, 3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        self.gru = ConvGRU(hidden_channels)
+        self.output_projection = nn.Conv2d(hidden_channels, num_classes, 1)
+        # The complete video model is exactly the frozen single-frame baseline
+        # at initialization, including every frame after the first one.
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    @staticmethod
+    def _resize_sequence(tensor: Tensor, size):
+        batch, time = tensor.shape[:2]
+        return F.interpolate(
+            tensor.flatten(0, 1), size=size, mode="bilinear", align_corners=False
+        ).unflatten(0, (batch, time))
+
+    def forward(
+        self,
+        src: Tensor,
+        base_logits: Tensor,
+        state: Optional[Tensor] = None,
+    ):
+        squeeze_time = src.ndim == 4
+        if squeeze_time:
+            src = src.unsqueeze(1)
+            base_logits = base_logits.unsqueeze(1)
+        if src.ndim != 5 or base_logits.ndim != 5:
+            raise ValueError("Temporal adapter expects image or video tensors")
+        if src.shape[:2] != base_logits.shape[:2] or src.shape[-2:] != base_logits.shape[-2:]:
+            raise ValueError(f"Temporal adapter input mismatch: {src.shape}, {base_logits.shape}")
+
+        height, width = src.shape[-2:]
+        small_size = (
+            max(1, int(round(height * self.scale))),
+            max(1, int(round(width * self.scale))),
+        )
+        small_src = self._resize_sequence(src, small_size)
+        small_probability = self._resize_sequence(base_logits.softmax(dim=2), small_size)
+        batch, time = src.shape[:2]
+        features = self.input_projection(
+            torch.cat([small_src, small_probability], dim=2).flatten(0, 1)
+        ).unflatten(0, (batch, time))
+
+        reset_frame = state is None
+        hidden, state = self.gru(features, state)
+        residual = self.output_projection(hidden.flatten(0, 1)).unflatten(0, (batch, time))
+        residual = self._resize_sequence(residual, (height, width))
+        if reset_frame:
+            # A reset frame is an exact spatial-only result. The updated state
+            # is still returned so temporal corrections can start next frame.
+            first_frame_gate = torch.ones(
+                (1, time, 1, 1, 1), device=residual.device, dtype=residual.dtype
+            )
+            first_frame_gate[:, 0] = 0
+            residual = residual * first_frame_gate
+        if squeeze_time:
+            residual = residual[:, 0]
+        return residual, state
 
 
 class RVMForVideoSemanticSegmentation(nn.Module):
@@ -26,6 +105,9 @@ class RVMForVideoSemanticSegmentation(nn.Module):
         variant: str = "mobilenetv3",
         num_classes: int = 13,
         pretrained_backbone: bool = False,
+        temporal_residual: bool = False,
+        temporal_hidden_channels: int = 16,
+        temporal_scale: float = 0.25,
     ):
         super().__init__()
         if variant not in ("mobilenetv3", "resnet50"):
@@ -35,6 +117,7 @@ class RVMForVideoSemanticSegmentation(nn.Module):
 
         self.variant = variant
         self.num_classes = num_classes
+        self.uses_temporal_residual = temporal_residual
         if variant == "mobilenetv3":
             self.backbone = MobileNetV3LargeEncoder(pretrained_backbone)
             self.aspp = LRASPP(960, 128)
@@ -45,6 +128,46 @@ class RVMForVideoSemanticSegmentation(nn.Module):
             self.decoder = RecurrentDecoder([64, 256, 512, 256], [128, 64, 32, 16])
 
         self.project_seg = Projection(16, num_classes)
+        self.temporal_residual_adapter = (
+            TemporalResidualAdapter(num_classes, temporal_hidden_channels, temporal_scale)
+            if temporal_residual
+            else None
+        )
+
+    def _forward_core(
+        self,
+        src: Tensor,
+        r1: Optional[Tensor] = None,
+        r2: Optional[Tensor] = None,
+        r3: Optional[Tensor] = None,
+        r4: Optional[Tensor] = None,
+    ):
+        f1, f2, f3, f4 = self.backbone(src)
+        f4 = self.aspp(f4)
+        hidden, *rec = self.decoder(src, f1, f2, f3, f4, r1, r2, r3, r4)
+        return self.project_seg(hidden), rec
+
+    def forward_spatial(self, src: Tensor, downsample_ratio: float = 1.0):
+        """Run each frame independently through the frozen Stage-1 network."""
+        if src.ndim not in (4, 5):
+            raise ValueError(f"Expected [B,C,H,W] or [B,T,C,H,W], got {src.shape}")
+        if not 0 < downsample_ratio <= 1:
+            raise ValueError("downsample_ratio must be in (0, 1].")
+        original_size = src.shape[-2:]
+        src_sm = (
+            self._interpolate(src, scale_factor=downsample_ratio)
+            if downsample_ratio != 1
+            else src
+        )
+        if src_sm.ndim == 5:
+            batch, time = src_sm.shape[:2]
+            logits, _ = self._forward_core(src_sm.flatten(0, 1))
+            logits = logits.unflatten(0, (batch, time))
+        else:
+            logits, _ = self._forward_core(src_sm)
+        if logits.shape[-2:] != original_size:
+            logits = self._interpolate(logits, size=original_size)
+        return logits
 
     def forward(
         self,
@@ -60,15 +183,17 @@ class RVMForVideoSemanticSegmentation(nn.Module):
         if not 0 < downsample_ratio <= 1:
             raise ValueError("downsample_ratio must be in (0, 1].")
 
+        if self.temporal_residual_adapter is not None:
+            base_logits = self.forward_spatial(src, downsample_ratio)
+            residual, temporal_state = self.temporal_residual_adapter(src, base_logits, r1)
+            return [base_logits + residual, temporal_state, None, None, None]
+
         src_sm = (
             self._interpolate(src, scale_factor=downsample_ratio)
             if downsample_ratio != 1
             else src
         )
-        f1, f2, f3, f4 = self.backbone(src_sm)
-        f4 = self.aspp(f4)
-        hidden, *rec = self.decoder(src_sm, f1, f2, f3, f4, r1, r2, r3, r4)
-        logits = self.project_seg(hidden)
+        logits, rec = self._forward_core(src_sm, r1, r2, r3, r4)
         if logits.shape[-2:] != src.shape[-2:]:
             logits = self._interpolate(logits, size=src.shape[-2:])
         return [logits, *rec]

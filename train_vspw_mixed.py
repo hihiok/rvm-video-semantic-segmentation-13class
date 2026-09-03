@@ -34,6 +34,8 @@ from semantic_utils import (
     seed_worker,
     semantic_loss,
     causal_temporal_consistency_loss,
+    multiclass_laplacian_loss,
+    rvm_temporal_derivative_loss,
     torch_load,
     unwrap_model,
 )
@@ -78,18 +80,29 @@ def parse_args(argv=None):
     parser.add_argument("--stage3-static-batches", type=int, default=1)
     parser.add_argument(
         "--stage2-trainable-scope",
-        choices=("recurrent", "recurrent_head", "decoder", "all"),
+        choices=("temporal_residual", "recurrent", "recurrent_head", "decoder", "all"),
         default="all",
         help="Trainable modules during stage 2; recurrent freezes every spatial module and BN statistic.",
     )
     parser.add_argument(
         "--stage3-trainable-scope",
-        choices=("recurrent", "recurrent_head", "decoder", "all"),
+        choices=("temporal_residual", "recurrent", "recurrent_head", "decoder", "all"),
         default="all",
         help="Trainable modules during stage 3. Distributed runs require the same scope in both stages.",
     )
     parser.add_argument("--stage2-temporal-weight", type=float, default=0.0)
     parser.add_argument("--stage3-temporal-weight", type=float, default=0.0)
+    parser.add_argument("--stage2-laplacian-weight", type=float, default=0.0)
+    parser.add_argument("--stage3-laplacian-weight", type=float, default=0.0)
+    parser.add_argument("--stage2-rvm-temporal-weight", type=float, default=0.0)
+    parser.add_argument("--stage3-rvm-temporal-weight", type=float, default=0.0)
+    parser.add_argument("--laplacian-levels", type=int, default=5)
+    parser.add_argument("--rvm-temporal-beta", type=float, default=0.1)
+    parser.add_argument(
+        "--temporal-residual-adapter", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--temporal-hidden-channels", type=int, default=16)
+    parser.add_argument("--temporal-adapter-scale", type=float, default=0.25)
     parser.add_argument("--temporal-boundary-radius", type=int, default=2)
     parser.add_argument("--temporal-temperature", type=float, default=1.0)
     parser.add_argument("--frame-stride", type=int, default=1)
@@ -145,11 +158,13 @@ def parse_args(argv=None):
         parser.error("Stage lengths must be nonnegative and their total must be positive")
     for field in (
         "stage2_clip_length", "stage3_clip_length", "stage2_video_batches",
-        "stage2_static_batches", "stage3_video_batches", "stage3_static_batches",
-        "batch_size", "static_batch_size", "gradient_accumulation",
+        "stage3_video_batches", "batch_size", "static_batch_size", "gradient_accumulation",
     ):
         if getattr(args, field) < 1:
             parser.error(f"--{field.replace('_', '-')} must be at least 1")
+    for field in ("stage2_static_batches", "stage3_static_batches"):
+        if getattr(args, field) < 0:
+            parser.error(f"--{field.replace('_', '-')} cannot be negative")
     if not 0 <= args.static_validation_weight <= 1:
         parser.error("--static-validation-weight must be between 0 and 1")
     if args.input_width < 1 or args.input_height < 1 or args.input_width * 9 != args.input_height * 16:
@@ -158,6 +173,31 @@ def parse_args(argv=None):
         parser.error("--max-frame-gap cannot be negative")
     if args.stage2_temporal_weight < 0 or args.stage3_temporal_weight < 0:
         parser.error("Temporal loss weights cannot be negative")
+    for field in (
+        "stage2_laplacian_weight", "stage3_laplacian_weight",
+        "stage2_rvm_temporal_weight", "stage3_rvm_temporal_weight",
+    ):
+        if getattr(args, field) < 0:
+            parser.error(f"--{field.replace('_', '-')} cannot be negative")
+    if args.laplacian_levels < 1:
+        parser.error("--laplacian-levels must be positive")
+    if args.rvm_temporal_beta < 0:
+        parser.error("--rvm-temporal-beta cannot be negative")
+    if args.temporal_hidden_channels < 1:
+        parser.error("--temporal-hidden-channels must be positive")
+    if not 0 < args.temporal_adapter_scale <= 1:
+        parser.error("--temporal-adapter-scale must be in (0,1]")
+    if args.temporal_residual_adapter and (
+        args.stage2_trainable_scope != "temporal_residual"
+        or args.stage3_trainable_scope != "temporal_residual"
+    ):
+        parser.error("Temporal residual adapter requires temporal_residual trainable scope")
+    if args.temporal_residual_adapter and (
+        args.stage2_static_batches or args.stage3_static_batches
+    ):
+        parser.error(
+            "Strict first-frame bypass has no trainable static path; set both static batch counts to 0"
+        )
     if args.temporal_boundary_radius < 0:
         parser.error("--temporal-boundary-radius cannot be negative")
     if args.temporal_temperature <= 0:
@@ -179,6 +219,8 @@ def stage_for_epoch(args, epoch):
             "static_batches": args.stage2_static_batches,
             "trainable_scope": getattr(args, "stage2_trainable_scope", "all"),
             "temporal_weight": getattr(args, "stage2_temporal_weight", 0.0),
+            "laplacian_weight": getattr(args, "stage2_laplacian_weight", 0.0),
+            "rvm_temporal_weight": getattr(args, "stage2_rvm_temporal_weight", 0.0),
         }
     return {
         "name": "stage3_temporal_finetuning",
@@ -187,19 +229,23 @@ def stage_for_epoch(args, epoch):
         "static_batches": args.stage3_static_batches,
         "trainable_scope": getattr(args, "stage3_trainable_scope", "all"),
         "temporal_weight": getattr(args, "stage3_temporal_weight", 0.0),
+        "laplacian_weight": getattr(args, "stage3_laplacian_weight", 0.0),
+        "rvm_temporal_weight": getattr(args, "stage3_rvm_temporal_weight", 0.0),
     }
 
 
 def configure_trainable_scope(model, scope):
     """Freeze spatial weights while allowing selected recurrent/semantic modules to learn."""
     module = unwrap_model(model)
-    if scope not in ("recurrent", "recurrent_head", "decoder", "all"):
+    if scope not in ("temporal_residual", "recurrent", "recurrent_head", "decoder", "all"):
         raise ValueError(f"Unknown trainable scope: {scope}")
 
     trainable = []
     for name, parameter in module.named_parameters():
         is_recurrent = ".gru." in name
-        if scope == "recurrent":
+        if scope == "temporal_residual":
+            enabled = name.startswith("temporal_residual_adapter.")
+        elif scope == "recurrent":
             enabled = is_recurrent
         elif scope == "recurrent_head":
             enabled = is_recurrent or name.startswith("project_seg.")
@@ -219,7 +265,13 @@ def set_training_mode_for_scope(model, scope):
     """Keep BatchNorm statistics frozen whenever its spatial block is frozen."""
     model.train()
     module = unwrap_model(model)
-    if scope in ("recurrent", "recurrent_head"):
+    if scope == "temporal_residual":
+        module.backbone.eval()
+        module.aspp.eval()
+        module.decoder.eval()
+        module.project_seg.eval()
+        module.temporal_residual_adapter.train()
+    elif scope in ("recurrent", "recurrent_head"):
         module.backbone.eval()
         module.aspp.eval()
         module.decoder.eval()
@@ -369,7 +421,7 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
 
 def mixed_batch_sources(video_count, video_batches, static_batches):
     """Replay static batches after every video group, including a short final group."""
-    if video_count < 0 or video_batches < 1 or static_batches < 1:
+    if video_count < 0 or video_batches < 1 or static_batches < 0:
         raise ValueError("Invalid video count or source ratio")
     for start in range(0, video_count, video_batches):
         for _ in range(min(video_batches, video_count - start)):
@@ -394,8 +446,12 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
     totals = {
         "video_loss": 0.0,
         "video_semantic_loss": 0.0,
-        "video_temporal_loss": 0.0,
-        "video_temporal_pixels": 0.0,
+        "video_laplacian_loss": 0.0,
+        "video_stable_temporal_loss": 0.0,
+        "video_stable_temporal_pixels": 0.0,
+        "video_rvm_temporal_loss": 0.0,
+        "video_rvm_temporal_pixels": 0.0,
+        "video_rvm_changed_pixels": 0.0,
         "video_samples": 0,
         "static_loss": 0.0,
         "static_samples": 0,
@@ -411,18 +467,44 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
                 logits, masks, logits.shape[2], weights, args.ignore_index,
                 args.ce_weight, args.dice_weight,
             )
-            temporal_loss = logits.sum() * 0.0
-            temporal_pixels = 0
+            laplacian_loss = logits.sum() * 0.0
+            if stage["laplacian_weight"] > 0:
+                laplacian_loss = multiclass_laplacian_loss(
+                    logits,
+                    masks,
+                    logits.shape[2],
+                    ignore_index=args.ignore_index,
+                    max_levels=args.laplacian_levels,
+                )
+            stable_temporal_loss = logits.sum() * 0.0
+            stable_temporal_pixels = 0
             if source == "video" and stage["temporal_weight"] > 0:
-                temporal_loss, temporal_pixels = causal_temporal_consistency_loss(
+                stable_temporal_loss, stable_temporal_pixels = causal_temporal_consistency_loss(
                     logits,
                     masks,
                     ignore_index=args.ignore_index,
                     boundary_radius=args.temporal_boundary_radius,
                     temperature=args.temporal_temperature,
                 )
+            rvm_temporal_loss = logits.sum() * 0.0
+            rvm_temporal_pixels = 0
+            rvm_changed_pixels = 0
+            if source == "video" and stage["rvm_temporal_weight"] > 0:
+                rvm_temporal_loss, rvm_temporal_pixels, rvm_changed_pixels = (
+                    rvm_temporal_derivative_loss(
+                        logits,
+                        masks,
+                        ignore_index=args.ignore_index,
+                        beta=args.rvm_temporal_beta,
+                    )
+                )
             domain_weight = args.video_loss_weight if source == "video" else args.static_loss_weight
-            objective = losses["total"] + stage["temporal_weight"] * temporal_loss
+            objective = (
+                losses["total"]
+                + stage["laplacian_weight"] * laplacian_loss
+                + stage["temporal_weight"] * stable_temporal_loss
+                + stage["rvm_temporal_weight"] * rvm_temporal_loss
+            )
             loss = objective * domain_weight / args.gradient_accumulation
         scaler.scale(loss).backward()
         if (index + 1) % args.gradient_accumulation == 0 or index + 1 == len(sources):
@@ -438,8 +520,12 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
         totals[f"{source}_samples"] += count
         if source == "video":
             totals["video_semantic_loss"] += losses["total"].detach().item() * count
-            totals["video_temporal_loss"] += temporal_loss.detach().item() * count
-            totals["video_temporal_pixels"] += temporal_pixels
+            totals["video_laplacian_loss"] += laplacian_loss.detach().item() * count
+            totals["video_stable_temporal_loss"] += stable_temporal_loss.detach().item() * count
+            totals["video_stable_temporal_pixels"] += stable_temporal_pixels
+            totals["video_rvm_temporal_loss"] += rvm_temporal_loss.detach().item() * count
+            totals["video_rvm_temporal_pixels"] += rvm_temporal_pixels
+            totals["video_rvm_changed_pixels"] += rvm_changed_pixels
         if rank == 0 and (index + 1) % args.print_every == 0:
             progress.set_postfix(
                 video=f"{totals['video_loss'] / max(totals['video_samples'], 1):.4f}",
@@ -453,8 +539,12 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
     return {
         "video_train_loss": totals["video_loss"] / max(totals["video_samples"], 1),
         "video_semantic_loss": totals["video_semantic_loss"] / max(totals["video_samples"], 1),
-        "video_temporal_loss": totals["video_temporal_loss"] / max(totals["video_samples"], 1),
-        "video_temporal_pixels": int(totals["video_temporal_pixels"]),
+        "video_laplacian_loss": totals["video_laplacian_loss"] / max(totals["video_samples"], 1),
+        "video_stable_temporal_loss": totals["video_stable_temporal_loss"] / max(totals["video_samples"], 1),
+        "video_stable_temporal_pixels": int(totals["video_stable_temporal_pixels"]),
+        "video_rvm_temporal_loss": totals["video_rvm_temporal_loss"] / max(totals["video_samples"], 1),
+        "video_rvm_temporal_pixels": int(totals["video_rvm_temporal_pixels"]),
+        "video_rvm_changed_pixels": int(totals["video_rvm_changed_pixels"]),
         "static_train_loss": totals["static_loss"] / max(totals["static_samples"], 1),
         "video_train_samples": int(totals["video_samples"]),
         "static_train_samples": int(totals["static_samples"]),
@@ -532,6 +622,10 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, args, class_n
         "frame_stride": args.frame_stride,
         "video_training": True,
         "mixed_replay_training": True,
+        "temporal_residual_adapter": args.temporal_residual_adapter,
+        "temporal_hidden_channels": args.temporal_hidden_channels,
+        "temporal_adapter_scale": args.temporal_adapter_scale,
+        "strict_reset_frame_spatial_bypass": args.temporal_residual_adapter,
         "training_stage": stage["name"],
         "baseline_metrics": baseline,
         "args": serialized_args,
@@ -726,7 +820,9 @@ def main(argv=None):
                 f"static_mIoU={static_metrics['miou']:.4f}, "
                 f"balanced={score:.4f}, retained={retained}, "
                 f"prediction_flip_rate_on_stable_gt={prediction_flip_rate:.6f}, "
-                f"scope={stage['trainable_scope']}, temporal_weight={stage['temporal_weight']:.4f}, "
+                f"scope={stage['trainable_scope']}, stable_temporal_weight={stage['temporal_weight']:.4f}, "
+                f"laplacian_weight={stage['laplacian_weight']:.4f}, "
+                f"rvm_temporal_weight={stage['rvm_temporal_weight']:.4f}, "
                 f"time={time.time() - started:.1f}s"
             )
             append_metrics_csv(args.output_dir / "metrics.csv", {

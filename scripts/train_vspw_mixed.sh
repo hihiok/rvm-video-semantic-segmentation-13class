@@ -97,6 +97,14 @@ args=(
   --stage3-trainable-scope "${STAGE3_TRAINABLE_SCOPE:-all}"
   --stage2-temporal-weight "${STAGE2_TEMPORAL_WEIGHT:-0.0}"
   --stage3-temporal-weight "${STAGE3_TEMPORAL_WEIGHT:-0.0}"
+  --stage2-laplacian-weight "${STAGE2_LAPLACIAN_WEIGHT:-0.0}"
+  --stage3-laplacian-weight "${STAGE3_LAPLACIAN_WEIGHT:-0.0}"
+  --stage2-rvm-temporal-weight "${STAGE2_RVM_TEMPORAL_WEIGHT:-0.0}"
+  --stage3-rvm-temporal-weight "${STAGE3_RVM_TEMPORAL_WEIGHT:-0.0}"
+  --laplacian-levels "${LAPLACIAN_LEVELS:-5}"
+  --rvm-temporal-beta "${RVM_TEMPORAL_BETA:-0.1}"
+  --temporal-hidden-channels "${TEMPORAL_HIDDEN_CHANNELS:-16}"
+  --temporal-adapter-scale "${TEMPORAL_ADAPTER_SCALE:-0.25}"
   --temporal-boundary-radius "${TEMPORAL_BOUNDARY_RADIUS:-2}"
   --temporal-temperature "${TEMPORAL_TEMPERATURE:-1.0}"
   --batch-size "${VIDEO_BATCH_SIZE}"
@@ -112,6 +120,9 @@ args=(
   --prediction-flip-penalty "${PREDICTION_FLIP_PENALTY:-0.1}"
   --save-every "${SAVE_EVERY:-10}"
 )
+if [[ "${TEMPORAL_RESIDUAL_ADAPTER:-0}" == "1" ]]; then
+  args+=(--temporal-residual-adapter)
+fi
 if [[ -n "${CLASS_WEIGHTS:-}" ]]; then
   args+=(--class-weights "${CLASS_WEIGHTS}")
 fi

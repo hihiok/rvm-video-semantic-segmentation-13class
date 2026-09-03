@@ -170,6 +170,9 @@ def build_model_and_optimizer(args, class_names, device, distributed):
         args.variant,
         num_classes=len(class_names),
         pretrained_backbone=args.init_checkpoint is None and args.resume is None,
+        temporal_residual=getattr(args, "temporal_residual_adapter", False),
+        temporal_hidden_channels=getattr(args, "temporal_hidden_channels", 16),
+        temporal_scale=getattr(args, "temporal_adapter_scale", 0.25),
     ).to(device)
     if args.init_checkpoint:
         report = load_compatible_weights(
@@ -180,13 +183,17 @@ def build_model_and_optimizer(args, class_names, device, distributed):
         print(json.dumps(report, indent=2))
     if args.sync_bn and distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    head_parameters = (
+        list(model.aspp.parameters())
+        + list(model.decoder.parameters())
+        + list(model.project_seg.parameters())
+    )
+    if model.temporal_residual_adapter is not None:
+        head_parameters += list(model.temporal_residual_adapter.parameters())
     optimizer = AdamW(
         [
             {"params": model.backbone.parameters(), "lr": args.backbone_learning_rate},
-            {
-                "params": list(model.aspp.parameters()) + list(model.decoder.parameters()) + list(model.project_seg.parameters()),
-                "lr": args.learning_rate,
-            },
+            {"params": head_parameters, "lr": args.learning_rate},
         ],
         weight_decay=args.weight_decay,
     )
@@ -205,7 +212,7 @@ def forward_clip(model, images, tbptt_chunk=0):
     for start in range(0, time, tbptt_chunk):
         logits, *recurrence = model(images[:, start : start + tbptt_chunk], *recurrence)
         outputs.append(logits)
-        recurrence = [state.detach() for state in recurrence]
+        recurrence = [state.detach() if state is not None else None for state in recurrence]
     return torch.cat(outputs, dim=1)
 
 

@@ -20,7 +20,11 @@ from dataset.video_semantic import VideoSequence
 from train_vspw_mixed import balanced_score, mixed_batch_sources, parse_args, stage_for_epoch
 from train_vspw_mixed import configure_trainable_scope
 from model import MultiClassFastGuidedFilterRefiner, RVMForVideoSemanticSegmentation
-from semantic_utils import causal_temporal_consistency_loss
+from semantic_utils import (
+    causal_temporal_consistency_loss,
+    multiclass_laplacian_loss,
+    rvm_temporal_derivative_loss,
+)
 from inference_video_semantic import scene_cut_score
 
 
@@ -159,6 +163,63 @@ def test_recurrent_scope_freezes_spatial_parameters():
     )
 
 
+def test_temporal_residual_scope_only_trains_new_adapter():
+    model = RVMForVideoSemanticSegmentation(
+        "mobilenetv3", 13, temporal_residual=True
+    )
+    trainable = configure_trainable_scope(model, "temporal_residual")
+    assert trainable
+    assert all(name.startswith("temporal_residual_adapter.") for name in trainable)
+    assert all(
+        parameter.requires_grad == name.startswith("temporal_residual_adapter.")
+        for name, parameter in model.named_parameters()
+    )
+
+
+def test_temporal_residual_reset_frame_is_exact_spatial_bypass():
+    model = RVMForVideoSemanticSegmentation(
+        "mobilenetv3", 13, temporal_residual=True, temporal_hidden_channels=4
+    ).eval()
+    with torch.no_grad():
+        model.temporal_residual_adapter.output_projection.bias[0] = 1.0
+        video = torch.rand(1, 2, 3, 32, 32)
+        spatial = model.forward_spatial(video)
+        output, state, *_ = model(video)
+        assert torch.equal(output[:, 0], spatial[:, 0])
+        assert not torch.equal(output[:, 1], spatial[:, 1])
+        reset_output = model(video[:, 1:2])[0]
+        assert torch.equal(reset_output[:, 0], spatial[:, 1])
+        assert state is not None
+
+
+def test_multiclass_laplacian_prefers_correct_boundary():
+    target = torch.zeros(1, 1, 16, 16, dtype=torch.long)
+    target[:, :, :, 8:] = 1
+    correct = torch.full((1, 1, 2, 16, 16), -8.0)
+    correct[:, :, 0, :, :8] = 8.0
+    correct[:, :, 1, :, 8:] = 8.0
+    wrong = correct.flip(-1)
+    correct_loss = multiclass_laplacian_loss(correct, target, 2, max_levels=2)
+    wrong_loss = multiclass_laplacian_loss(wrong, target, 2, max_levels=2)
+    assert correct_loss < wrong_loss
+
+
+def test_rvm_temporal_derivative_matches_label_change():
+    target = torch.zeros(1, 2, 4, 4, dtype=torch.long)
+    target[:, 1] = 1
+    correct = torch.full((1, 2, 2, 4, 4), -10.0)
+    correct[:, 0, 0] = 10.0
+    correct[:, 1, 1] = 10.0
+    static = correct[:, :1].expand(-1, 2, -1, -1, -1).clone()
+    correct_loss, valid_pixels, changed_pixels = rvm_temporal_derivative_loss(
+        correct, target
+    )
+    static_loss, _, _ = rvm_temporal_derivative_loss(static, target)
+    assert valid_pixels == 16
+    assert changed_pixels == 16
+    assert correct_loss < static_loss
+
+
 def test_multiclass_guided_filter_supports_arbitrary_class_count():
     refiner = MultiClassFastGuidedFilterRefiner(radius=1, eps=1e-4)
     base_rgb = torch.rand(2, 3, 8, 12)
@@ -182,6 +243,28 @@ def test_temporal_preserve_arguments_are_recorded_per_stage(tmp_path):
     assert stage_for_epoch(args, 0)["trainable_scope"] == "recurrent"
     assert stage_for_epoch(args, 0)["temporal_weight"] == pytest.approx(0.05)
     assert stage_for_epoch(args, args.stage2_epochs)["temporal_weight"] == pytest.approx(0.10)
+
+
+def test_rvm_residual_arguments_are_recorded_and_static_training_is_disabled(tmp_path):
+    args = parse_args([
+        "--data-root", str(tmp_path / "vspw"),
+        "--static-root", str(tmp_path / "static"),
+        "--init-checkpoint", str(tmp_path / "initial.pth"),
+        "--temporal-residual-adapter",
+        "--stage2-trainable-scope", "temporal_residual",
+        "--stage3-trainable-scope", "temporal_residual",
+        "--stage2-static-batches", "0",
+        "--stage3-static-batches", "0",
+        "--stage2-laplacian-weight", "0.05",
+        "--stage3-laplacian-weight", "0.05",
+        "--stage2-rvm-temporal-weight", "0.05",
+        "--stage3-rvm-temporal-weight", "0.05",
+    ])
+    stage2 = stage_for_epoch(args, 0)
+    stage3 = stage_for_epoch(args, args.stage2_epochs)
+    assert stage2["static_batches"] == 0
+    assert stage2["laplacian_weight"] == pytest.approx(0.05)
+    assert stage3["rvm_temporal_weight"] == pytest.approx(0.05)
 
 
 def test_scene_cut_score_detects_abrupt_full_frame_change():

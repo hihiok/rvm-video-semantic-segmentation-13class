@@ -305,7 +305,13 @@ def main():
         raise ValueError(f"Checkpoint class mapping is not the fixed 13-class mapping: {class_names}")
     input_size = resolve_input_shape(args, checkpoint)
     print(f"Inference input resolution: {input_size[1]}x{input_size[0]}")
-    model = RVMForVideoSemanticSegmentation(checkpoint.get("variant", "mobilenetv3"), len(class_names))
+    model = RVMForVideoSemanticSegmentation(
+        checkpoint.get("variant", "mobilenetv3"),
+        len(class_names),
+        temporal_residual=checkpoint.get("temporal_residual_adapter", False),
+        temporal_hidden_channels=checkpoint.get("temporal_hidden_channels", 16),
+        temporal_scale=checkpoint.get("temporal_adapter_scale", 0.25),
+    )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval().to(args.device)
     guided_refiner = None

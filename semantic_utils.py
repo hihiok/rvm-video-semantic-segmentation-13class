@@ -130,6 +130,129 @@ def semantic_loss(
     return {"total": ce_weight * ce + dice_weight * dice, "cross_entropy": ce, "dice": dice}
 
 
+def _gaussian_kernel(device, dtype):
+    kernel = torch.tensor(
+        [
+            [1, 4, 6, 4, 1],
+            [4, 16, 24, 16, 4],
+            [6, 24, 36, 24, 6],
+            [4, 16, 24, 16, 4],
+            [1, 4, 6, 4, 1],
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    return (kernel / 256).reshape(1, 1, 5, 5)
+
+
+def _gaussian_convolution(image: Tensor, kernel: Tensor):
+    batch, channels, height, width = image.shape
+    flat = image.reshape(batch * channels, 1, height, width)
+    flat = F.pad(flat, (2, 2, 2, 2), mode="reflect")
+    return F.conv2d(flat, kernel).reshape(batch, channels, height, width)
+
+
+def _laplacian_level(image: Tensor, kernel: Tensor):
+    height = image.shape[-2] - image.shape[-2] % 2
+    width = image.shape[-1] - image.shape[-1] % 2
+    image = image[..., :height, :width]
+    down = _gaussian_convolution(image, kernel)[..., ::2, ::2]
+    expanded = torch.zeros(
+        (*down.shape[:-2], down.shape[-2] * 2, down.shape[-1] * 2),
+        device=image.device,
+        dtype=image.dtype,
+    )
+    expanded[..., ::2, ::2] = down * 4
+    up = _gaussian_convolution(expanded, kernel)
+    return image - up, down
+
+
+def multiclass_laplacian_loss(
+    logits: Tensor,
+    target: Tensor,
+    num_classes: int,
+    ignore_index: int = 255,
+    max_levels: int = 5,
+):
+    """RVM-style multi-scale Laplacian loss over all semantic probabilities."""
+    if max_levels < 1:
+        raise ValueError("max_levels must be positive")
+    logits, target = flatten_video_logits_target(logits, target)
+    valid = target.ne(ignore_index).unsqueeze(1)
+    safe_target = target.masked_fill(~valid.squeeze(1), 0)
+    probability = logits.softmax(dim=1) * valid
+    one_hot = F.one_hot(safe_target, num_classes=num_classes).permute(0, 3, 1, 2)
+    one_hot = one_hot.to(probability.dtype) * valid
+    kernel = _gaussian_kernel(probability.device, probability.dtype)
+
+    loss = probability.sum() * 0.0
+    used_levels = 0
+    current_probability, current_target, current_valid = probability, one_hot, valid
+    for level in range(max_levels):
+        if min(current_probability.shape[-2:]) < 4:
+            break
+        probability_detail, current_probability = _laplacian_level(
+            current_probability, kernel
+        )
+        target_detail, current_target = _laplacian_level(current_target, kernel)
+        height, width = probability_detail.shape[-2:]
+        level_valid = current_valid[..., :height, :width]
+        denominator = level_valid.sum().clamp_min(1) * num_classes
+        loss = loss + (2 ** level) * (
+            (probability_detail - target_detail).abs() * level_valid
+        ).sum() / denominator
+        used_levels += 1
+        current_valid = F.interpolate(
+            level_valid.float(), size=current_probability.shape[-2:], mode="nearest"
+        ).bool()
+    return loss / max(used_levels, 1)
+
+
+def rvm_temporal_derivative_loss(
+    logits: Tensor,
+    target: Tensor,
+    ignore_index: int = 255,
+    beta: float = 0.1,
+):
+    """Match predicted and GT frame-to-frame changes, adapted from RVM alpha coherence."""
+    if logits.ndim != 5 or target.ndim != 4:
+        raise ValueError(
+            f"Expected logits [B,T,C,H,W] and target [B,T,H,W], got "
+            f"{logits.shape} and {target.shape}"
+        )
+    if logits.shape[:2] != target.shape[:2] or logits.shape[-2:] != target.shape[-2:]:
+        raise ValueError(f"Temporal logits/target mismatch: {logits.shape}, {target.shape}")
+    if beta < 0:
+        raise ValueError("beta must be nonnegative")
+    if logits.shape[1] < 2:
+        return logits.sum() * 0.0, 0, 0
+
+    valid = (
+        target[:, 1:].ne(ignore_index)
+        & target[:, :-1].ne(ignore_index)
+    )
+    valid_count = int(valid.sum().detach().item())
+    if valid_count == 0:
+        return logits.sum() * 0.0, 0, 0
+
+    safe_target = target.masked_fill(target.eq(ignore_index), 0)
+    target_probability = F.one_hot(
+        safe_target, num_classes=logits.shape[2]
+    ).movedim(-1, 2).to(logits.dtype)
+    probability = logits.softmax(dim=2)
+    prediction_delta = probability[:, 1:] - probability[:, :-1]
+    target_delta = target_probability[:, 1:] - target_probability[:, :-1]
+    if beta == 0:
+        channel_loss = (prediction_delta - target_delta).abs()
+    else:
+        channel_loss = F.smooth_l1_loss(
+            prediction_delta, target_delta, reduction="none", beta=beta
+        )
+    pixel_loss = channel_loss.mean(dim=2)
+    changed = valid & target[:, 1:].ne(target[:, :-1])
+    return pixel_loss.masked_select(valid).mean(), valid_count, int(changed.sum().detach().item())
+
+
 def semantic_boundary_mask(target: Tensor, ignore_index: int = 255, radius: int = 1):
     """Return pixels at, or close to, a valid semantic-label boundary."""
     if target.ndim not in (3, 4):
