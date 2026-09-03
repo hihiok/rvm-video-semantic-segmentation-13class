@@ -18,6 +18,7 @@ from config import (
 )
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+BUNDLED_PLACES_IO = Path(__file__).resolve().parent / "metadata" / "IO_places365.txt"
 
 
 def parse_args():
@@ -44,7 +45,7 @@ def empty_labels():
 
 
 def norm_cat(raw: str) -> str:
-    raw = raw.strip().replace("\\", "/").lstrip("/")
+    raw = raw.strip().replace("\\", "/").strip("/").lower()
     parts = raw.split("/")
     if len(parts) >= 2 and len(parts[0]) == 1:
         return "/".join(parts[1:])
@@ -63,17 +64,6 @@ def find_one(root: Path, names):
     return None
 
 
-def parse_categories(path: Path):
-    idx_to_raw = {}
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            a, b = line.strip().rsplit(" ", 1)
-            idx_to_raw[int(b)] = a
-    return idx_to_raw
-
-
 def parse_io(path: Path):
     out = {}
     with path.open("r", encoding="utf-8") as f:
@@ -83,6 +73,46 @@ def parse_io(path: Path):
             a, b = line.strip().rsplit(" ", 1)
             out[norm_cat(a)] = int(b)  # 1 indoor, 2 outdoor
     return out
+
+
+def flat_places_alias(cat: str) -> str:
+    """Map official names such as field/cultivated to folder-style field-cultivated."""
+    return norm_cat(cat).replace("/", "-").replace("_", "-")
+
+
+def build_places_alias_map(io_map):
+    aliases = {}
+    collisions = defaultdict(set)
+    for canonical in io_map:
+        candidates = {
+            canonical,
+            canonical.replace("/", "-"),
+            canonical.replace("_", "-"),
+            flat_places_alias(canonical),
+        }
+        for alias in candidates:
+            alias = norm_cat(alias)
+            if alias in aliases and aliases[alias] != canonical:
+                collisions[alias].update({aliases[alias], canonical})
+            else:
+                aliases[alias] = canonical
+    if collisions:
+        raise RuntimeError(f"Ambiguous Places365 folder aliases: {dict(collisions)}")
+    return aliases
+
+
+def canonicalize_places_category(raw: str, alias_map):
+    raw = norm_cat(raw)
+    candidates = [
+        raw,
+        raw.replace("_", "-"),
+        raw.replace("/", "-"),
+        raw.replace("/", "-").replace("_", "-"),
+    ]
+    for x in candidates:
+        if x in alias_map:
+            return alias_map[x]
+    return None
 
 
 def places_labels(cat: str, io_map):
@@ -111,59 +141,122 @@ def places_labels(cat: str, io_map):
 
 
 def locate_places_dirs(root: Path):
-    train = find_one(root, ["data_256", "train"])
-    val = find_one(root, ["val_256", "val"])
-    cat_file = find_one(root, ["categories_places365.txt"])
+    """Resolve both standard Places365 and the local versions/1 folder layout.
+
+    Supported examples:
+      root/versions/1/train/<flattened-category>/*.jpg
+      root/versions/1/val/<flattened-category>/*.jpg
+      root/train/<category>/*.jpg
+      root/val/<category>/*.jpg
+      root/data_256/... and root/val_256/...
+
+    Local categories_places365.txt and IO_places365.txt are not required.  The
+    official indoor/outdoor taxonomy is bundled with this repository.
+    """
+    pairs = [
+        (root / "versions" / "1" / "train", root / "versions" / "1" / "val"),
+        (root / "train", root / "val"),
+        (root / "data_256", root / "val_256"),
+    ]
+    train = val = None
+    for tr, va in pairs:
+        if tr.is_dir() and va.is_dir():
+            train, val = tr, va
+            break
+    if train is None:
+        train = find_one(root, ["data_256", "train"])
+        val = find_one(root, ["val_256", "val"])
+
     io_file = find_one(root, ["IO_places365.txt"])
-    val_file = find_one(root, ["places365_val.txt", "val.txt"])
-    missing = [n for n, p in [("train", train), ("val", val), ("categories", cat_file), ("IO", io_file), ("val labels", val_file)] if p is None]
+    if io_file is None:
+        io_file = BUNDLED_PLACES_IO
+
+    missing = []
+    if train is None or not train.is_dir():
+        missing.append("train")
+    if val is None or not val.is_dir():
+        missing.append("val")
+    if not io_file.is_file():
+        missing.append(f"IO taxonomy ({io_file})")
     if missing:
         raise FileNotFoundError(f"Places365 missing: {missing}; root={root}")
-    return train, val, cat_file, io_file, val_file
+    return train, val, io_file
+
+
+def iter_places_category_dirs(split_root: Path, alias_map):
+    """Yield (canonical_category, dir, image_files) for any folder containing images."""
+    unknown = []
+    seen = set()
+    for dirpath, _, filenames in os.walk(split_root):
+        image_names = [x for x in filenames if Path(x).suffix.lower() in IMG_EXTS]
+        if not image_names:
+            continue
+        d = Path(dirpath)
+        rel = d.relative_to(split_root)
+        raw = norm_cat(str(rel))
+        cat = canonicalize_places_category(raw, alias_map)
+        if cat is None:
+            # Flat local layout normally needs only the leaf folder name.
+            cat = canonicalize_places_category(d.name, alias_map)
+        if cat is None:
+            unknown.append(str(rel))
+            continue
+        key = (cat, str(d.resolve()))
+        if key in seen:
+            continue
+        seen.add(key)
+        yield cat, d, [d / x for x in image_names]
+    if unknown:
+        preview = sorted(set(unknown))[:50]
+        raise RuntimeError(
+            f"Unrecognized Places365 category folders ({len(set(unknown))} total), "
+            f"first entries={preview}. Do not guess category mappings."
+        )
 
 
 def add_places(records, root: Path, cap: int, rng: random.Random):
-    train_root, val_root, cat_file, io_file, val_file = locate_places_dirs(root)
-    idx_to_raw = parse_categories(cat_file)
+    train_root, val_root, io_file = locate_places_dirs(root)
     io_map = parse_io(io_file)
+    alias_map = build_places_alias_map(io_map)
 
-    for idx, raw in idx_to_raw.items():
-        cat = norm_cat(raw)
-        rel = raw.strip().lstrip("/")
-        d = train_root / rel
-        if not d.is_dir():
-            # Some extracted archives use only category name directories.
-            d = train_root / cat
-        if not d.is_dir():
-            continue
-        imgs = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS]
+    print(f"PLACES_TRAIN_ROOT={train_root}")
+    print(f"PLACES_VAL_ROOT={val_root}")
+    print(f"PLACES_IO_SOURCE={io_file}")
+
+    train_categories = 0
+    for cat, _, imgs in iter_places_category_dirs(train_root, alias_map):
+        train_categories += 1
         if len(imgs) > cap:
             imgs = rng.sample(imgs, cap)
         y = places_labels(cat, io_map)
         if all(v < 0 for v in y.values()):
             continue
         for p in imgs:
-            records["train"].append({"image": str(p.resolve()), "labels": y, "source": "places365", "detail": cat})
+            records["train"].append({
+                "image": str(p.resolve()), "labels": dict(y),
+                "source": "places365", "detail": cat,
+            })
 
-    with val_file.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            parts = line.strip().split()
-            if len(parts) < 2:
-                continue
-            rel_name, class_idx = parts[0], int(parts[1])
-            p = val_root / Path(rel_name).name
-            if not p.exists():
-                p = val_root / rel_name
-            if not p.exists():
-                continue
-            cat = norm_cat(idx_to_raw[class_idx])
-            y = places_labels(cat, io_map)
-            if all(v < 0 for v in y.values()):
-                continue
-            split = stable_half(p.name)
-            records[split].append({"image": str(p.resolve()), "labels": y, "source": "places365", "detail": cat})
+    val_categories = 0
+    for cat, _, imgs in iter_places_category_dirs(val_root, alias_map):
+        val_categories += 1
+        y = places_labels(cat, io_map)
+        if all(v < 0 for v in y.values()):
+            continue
+        for p in imgs:
+            rel_key = str(p.relative_to(val_root)).replace("\\", "/")
+            split = stable_half(rel_key)
+            records[split].append({
+                "image": str(p.resolve()), "labels": dict(y),
+                "source": "places365", "detail": cat,
+            })
+
+    print(f"PLACES_RECOGNIZED_TRAIN_CATEGORY_DIRS={train_categories}")
+    print(f"PLACES_RECOGNIZED_VAL_CATEGORY_DIRS={val_categories}")
+    if train_categories == 0 or val_categories == 0:
+        raise RuntimeError(
+            f"No Places365 category directories recognized: train={train_categories}, val={val_categories}"
+        )
 
 
 def coco_split(root: Path, split: str):
