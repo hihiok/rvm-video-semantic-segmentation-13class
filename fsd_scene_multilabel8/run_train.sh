@@ -33,5 +33,5 @@ if [[ -n "${RESUME}" ]]; then
   ARGS+=(--resume-train-state "${RESUME}")
 fi
 
-python -u train_fsd_scene_multilabel8.py "${ARGS[@]}" \
+python -u train_fsd_scene_multilabel8_640x360.py "${ARGS[@]}" \
   2>&1 | tee -a "${OUT}/train.log"
