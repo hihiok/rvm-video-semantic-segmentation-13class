@@ -19,7 +19,7 @@ python -u make_smoke_manifest.py \
   --output-root "${SMOKE_DATA_ROOT}" \
   --per-state 24
 
-python -u train_fsd_scene_multilabel8.py \
+python -u train_fsd_scene_multilabel8_640x360.py \
   --fsd-root "${FSD_ROOT}" \
   --data-root "${SMOKE_DATA_ROOT}" \
   --output-dir "${OUT}" \
