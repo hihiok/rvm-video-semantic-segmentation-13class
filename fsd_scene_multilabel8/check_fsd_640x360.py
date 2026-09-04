@@ -42,14 +42,15 @@ def main():
         raise FileNotFoundError(f'Not an FSD repo: {fsd_root}; missing {expected_model}')
     sys.path.insert(0, str(fsd_root))
 
-    # Bootstrap the existing FSD module using a supported UltraFace scalar size.
-    # The actual scene tensor below is explicitly 360x640.
+    # The original UltraFace scalar API initializes a 4:3 config family. Use a
+    # supported 640 bootstrap only for module initialization; the actual scene
+    # transform is explicitly [height=360,width=640].
     from vision.ssd.config.fd_config import define_img_size
     define_img_size(640)
-    from vision.ssd.data_preprocessing import YUV444TestTransform_scene
+    from vision.ssd.data_preprocessing import YUVTestTransform_scene
     from vision.ssd.mb_tiny_RFB_fd_3 import create_Mb_Tiny_RFB_fd_3_scene_noRFB
 
-    transform = YUV444TestTransform_scene([360, 640])
+    transform = YUVTestTransform_scene([360, 640])
     dummy_bgr = np.zeros((720, 1280, 3), dtype=np.uint8)
     x = apply_transform(transform, dummy_bgr)
     print('TRANSFORMED_SHAPE=', tuple(x.shape))
