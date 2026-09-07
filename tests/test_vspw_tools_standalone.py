@@ -74,7 +74,7 @@ class StaticResolverTests(unittest.TestCase):
                 write_pair(root, "train", "train", 1)
                 write_pair(root, "val", "val", 12)
             result = resolver.discover_candidates([parent])
-            self.assertEqual(result[0]["root"], str(preferred))
+            # The resolver intentionally returns canonical absolute paths.\n            # Resolve the expected path as well so this remains portable on\n            # hosts where /tmp is a symlink to another filesystem.\n            self.assertEqual(result[0]["root"], str(preferred.resolve()))
 
     def test_fails_loudly_for_tied_candidates(self):
         with tempfile.TemporaryDirectory() as temporary:
