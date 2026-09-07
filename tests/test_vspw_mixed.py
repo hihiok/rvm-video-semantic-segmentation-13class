@@ -187,8 +187,12 @@ def test_temporal_residual_reset_frame_is_exact_spatial_bypass():
         output, state, *_ = model(video)
         assert torch.equal(output[:, 0], spatial[:, 0])
         assert not torch.equal(output[:, 1], spatial[:, 1])
-        reset_output = model(video[:, 1:2])[0]
-        assert torch.equal(reset_output[:, 0], spatial[:, 1])
+        reset_frame = video[:, 1:2]
+        reset_spatial = model.forward_spatial(reset_frame)
+        reset_output = model(reset_frame)[0]
+        # Compare identical single-frame batch shapes so torch.equal checks
+        # the bypass itself, not convolution rounding across batch shapes.
+        assert torch.equal(reset_output, reset_spatial)
         assert state is not None
 
 
