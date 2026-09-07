@@ -1,0 +1,435 @@
+# UltraFace Slim 8-label scene classification 640x360 — FAST/BALANCED V2
+
+This runbook is self-contained for a new CodeAgent chat.
+
+## 0. Goal
+
+Replace the currently very slow V1 training with a faster balanced training pipeline while keeping the same model and 640x360 input.
+
+Model:
+- original UltraFace slim / Mb_Tiny convolutional backbone
+- NO RFB
+- NO SSD extras
+- NO detection heads
+- AdaptiveAvgPool2d(1)
+- Linear(256, 8)
+
+Labels, exact order:
+1. night / 夜景
+2. indoor / 室内
+3. rain_snow / 雨/雪
+4. office / 办公场景
+5. outdoor / 户外
+6. landscape / 风景
+7. sports / 运动
+8. objective_image / 客观图
+
+Multi-label target values:
+- 1 = positive
+- 0 = confirmed negative
+- -1 = unknown, ignored by loss/metrics
+
+Input MUST remain RGB 3x360x640.
+
+## 1. Why V1 must be stopped
+
+Observed V1 formal training had approximately 13,514 steps/epoch at batch 24 (~324k samples/epoch), GPU utilization near 0%, and CPU DataLoader workers were the bottleneck.
+
+V1 also used 200 epochs copied from an older much smaller FSD dataset configuration. Do not continue that run.
+
+FAST V2 changes only data/throughput/training schedule, not the model architecture:
+- balanced train manifest
+- merge same-underlying-image records
+- Places365 cap per category = 250
+- keep every SEG13 positive
+- keep only sampled low-value SEG13 negatives (ratio 3x positives, minimum 5000)
+- batch default 128
+- workers default 16
+- prefetch factor 2
+- CPU DataLoader payload uint8; normalization moves to GPU
+- skip resize when source image is already 640x360
+- OpenCV internal threads disabled inside workers
+- 30 epochs
+- LR milestones 20,27
+- step throughput/data-wait/GPU-compute logging
+
+## 2. Repository
+
+Repository:
+`https://github.com/hihiok/rvm-video-semantic-segmentation-13class.git`
+
+Branch:
+`agent/ultraface-slim-scene-multilabel8-640x360-fast-v2`
+
+Checkout path:
+`/data/pub1/z00919662/segmentation/ultraface-slim-scene-multilabel8-640x360-fast-v2`
+
+Do not modify source code locally.
+
+### Git update rules
+
+If checkout does not exist, clone the specified branch.
+
+If it exists:
+1. `git status --porcelain` must be empty.
+2. If not clean: STOP. Do not stash/reset/commit local changes.
+3. `git fetch origin agent/ultraface-slim-scene-multilabel8-640x360-fast-v2`
+4. checkout the exact branch.
+5. update only with `git merge --ff-only origin/agent/ultraface-slim-scene-multilabel8-640x360-fast-v2`
+6. verify local HEAD == remote HEAD.
+7. verify working tree clean.
+
+If Git update fails, stop with HUMAN_ACTION_REQUIRED: YES.
+
+## 3. Precisely stop ONLY the old V1 training
+
+Old output directory:
+`/data/pub1/z00919662/scene_multilabel/ultraface_slim_8label_640x360_v1/train`
+
+Before killing anything, print all candidate commands:
+
+```bash
+pgrep -af 'python.*train.py' || true
+```
+
+Only terminate processes whose `/proc/<pid>/cmdline` contains BOTH:
+- `train.py`
+- `/data/pub1/z00919662/scene_multilabel/ultraface_slim_8label_640x360_v1/train`
+
+Example safe logic:
+
+```bash
+OLD_OUT='/data/pub1/z00919662/scene_multilabel/ultraface_slim_8label_640x360_v1/train'
+MATCHED=()
+for pid in $(pgrep -f 'python.*train.py' || true); do
+  [[ -r "/proc/$pid/cmdline" ]] || continue
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+  if [[ "$cmd" == *"train.py"* && "$cmd" == *"$OLD_OUT"* ]]; then
+    echo "OLD_V1_MATCH pid=$pid cmd=$cmd"
+    MATCHED+=("$pid")
+  fi
+done
+for pid in "${MATCHED[@]}"; do kill -TERM "$pid" || true; done
+sleep 10
+for pid in "${MATCHED[@]}"; do
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "OLD_V1_STILL_ALIVE pid=$pid"
+    kill -KILL "$pid" || true
+  fi
+done
+```
+
+Do NOT kill any process that does not contain the exact old output path.
+
+Do NOT delete the old output directory. Keep V1 logs/checkpoints for audit.
+
+## 4. Environment
+
+Use existing conda environment exactly:
+`Ultraface`
+
+Do not create a new conda env or venv.
+Do not upgrade/downgrade torch/torchvision.
+
+Activate the existing environment using the server's available conda initialization, then verify:
+
+```bash
+echo "$CONDA_DEFAULT_ENV"
+which python
+python - <<'PY'
+import cv2, torch, numpy as np
+print('torch', torch.__version__)
+print('cuda', torch.cuda.is_available())
+print('cv2', cv2.__version__)
+assert torch.cuda.is_available()
+PY
+```
+
+Required:
+`CONDA_DEFAULT_ENV=Ultraface`
+
+## 5. Static checks
+
+```bash
+cd /data/pub1/z00919662/segmentation/ultraface-slim-scene-multilabel8-640x360-fast-v2
+python -m py_compile \
+  ultraface_scene_multilabel8/model.py \
+  ultraface_scene_multilabel8/optimize_manifest_fast_v2.py \
+  ultraface_scene_multilabel8/train_fast_v2_uint8.py \
+  fsd_scene_multilabel8/audit_manifest.py
+bash -n ultraface_scene_multilabel8/run_smoke_fast_v2.sh
+bash -n ultraface_scene_multilabel8/run_train_fast_v2.sh
+```
+
+Model smoke:
+
+```bash
+cd ultraface_scene_multilabel8
+python model.py
+```
+
+Must show input `(1, 3, 360, 640)` and output `(1, 8)`.
+
+## 6. Existing V1 manifest and new Fast V2 manifest
+
+Input manifest generated by the previous completed data preparation:
+`/data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_v1`
+
+New generated Fast V2 manifest:
+`/data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_fast_v2`
+
+Never modify the V1 manifest in place.
+Never modify any source dataset image/mask/annotation/label.
+
+Verify V1 manifest exists:
+
+```bash
+for s in train val test; do
+  test -s "/data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_v1/${s}.jsonl"
+done
+```
+
+Create Fast V2 manifest from V1 manifest only:
+
+```bash
+cd /data/pub1/z00919662/segmentation/ultraface-slim-scene-multilabel8-640x360-fast-v2/ultraface_scene_multilabel8
+rm -rf /data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_fast_v2
+python -u optimize_manifest_fast_v2.py \
+  --input-root /data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_v1 \
+  --output-root /data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_fast_v2 \
+  --places-cap-per-category 250 \
+  --seg-negative-ratio 3 \
+  --seg-negative-min 5000 \
+  --seed 20260907 \
+  2>&1 | tee /data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_fast_v2/optimize.log
+```
+
+The optimizer must:
+- keep all 10_scenes records
+- keep COCO objective-photo negatives already sampled in V1
+- cap Places365 train records per canonical category
+- keep every SEG13 rain_snow/landscape positive
+- downsample low-value SEG13 negative-only records
+- merge duplicate underlying images within each split
+- union compatible partial labels
+- turn conflicting known labels on the same underlying image to unknown (-1), and report conflicts
+- not alter val/test class distribution except duplicate merging
+
+Inspect:
+
+```bash
+cat /data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_fast_v2/fast_v2_summary.json
+```
+
+Report old vs new train record count and expected steps/epoch for batch 128.
+
+## 7. Audit Fast V2 manifest
+
+```bash
+cd /data/pub1/z00919662/segmentation/ultraface-slim-scene-multilabel8-640x360-fast-v2
+python -u fsd_scene_multilabel8/audit_manifest.py \
+  --data-root /data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_fast_v2
+```
+
+Hard rules:
+- each of 8 labels must have positive and negative supervision in train/val/test
+- train vs val underlying duplicate = HARD FAIL
+- train vs test underlying duplicate = HARD FAIL
+- val vs test duplicate = WARNING ONLY
+
+Also confirm the Fast V2 train record count is materially smaller than V1.
+If it is not smaller, STOP and report the summary; do not modify code locally.
+
+## 8. Select one free GPU
+
+Use `nvidia-smi` and choose a genuinely free GPU.
+Do not kill unrelated jobs.
+
+Export selected physical GPU as `GPU=<index>` when launching.
+
+## 9. Throughput smoke
+
+Start with:
+- batch=128
+- workers=16
+- prefetch=2
+
+```bash
+cd /data/pub1/z00919662/segmentation/ultraface-slim-scene-multilabel8-640x360-fast-v2/ultraface_scene_multilabel8
+GPU=<free_gpu> BATCH=128 WORKERS=16 PREFETCH=2 bash run_smoke_fast_v2.sh
+```
+
+Smoke runs only 30 train steps and 8 eval batches.
+
+The log must show lines like:
+`EPOCH ... STEP ... samples_s=... data_wait_ms_avg=... gpu_compute_ms_profiled=... eta_epoch_min=...`
+
+If CUDA OOM:
+- retry BATCH=96
+- then BATCH=64
+- if 64 still OOM, STOP
+
+Do not reduce 640x360 resolution.
+
+If DataLoader/host-memory errors occur:
+- keep the proven batch
+- retry WORKERS=12
+- then WORKERS=8
+
+If 128/16 is stable but `data_wait_ms_avg` remains clearly larger than profiled GPU compute time and CPU/RAM are healthy, run one additional smoke with WORKERS=24, PREFETCH=2.
+Use workers=24 for formal training only if samples/s improves >=10% and no host-memory/data-loader instability occurs. Otherwise use 16.
+
+Record:
+- batch selected
+- workers selected
+- samples/s
+- avg data wait ms
+- profiled GPU compute ms
+- approximate epoch ETA
+
+Smoke PASS requires:
+- forward/backward works
+- finite loss
+- checkpoint written
+- validation runs
+- no DataLoader crash/OOM
+
+## 10. Formal training
+
+New output root:
+`/data/pub1/z00919662/scene_multilabel/ultraface_slim_8label_640x360_fast_v2/train`
+
+This V2 run starts from epoch 0 because dataset/batch/scheduler changed. Do NOT resume the old V1 epoch-0 process/checkpoint.
+
+Use smoke-proven BATCH and WORKERS:
+
+```bash
+cd /data/pub1/z00919662/segmentation/ultraface-slim-scene-multilabel8-640x360-fast-v2/ultraface_scene_multilabel8
+GPU=<free_gpu> BATCH=<smoke_batch> WORKERS=<smoke_workers> PREFETCH=2 bash run_train_fast_v2.sh
+```
+
+Formal settings are fixed:
+- input 640x360 RGB
+- epochs 30
+- SGD
+- lr 1e-2
+- momentum 0.9
+- weight decay 1e-4
+- MultiStepLR milestones 20,27
+- gamma 0.1
+- AMP enabled
+- masked BCEWithLogitsLoss
+- unknown -1 ignored
+
+Do not increase back to 200 epochs.
+
+## 11. Resume rule for Fast V2 only
+
+If Fast V2 formal training is later interrupted and this file is valid:
+`/data/pub1/z00919662/scene_multilabel/ultraface_slim_8label_640x360_fast_v2/train/last_train_state.pth`
+
+then resume Fast V2 with:
+
+```bash
+GPU=<free_gpu> BATCH=<same_batch> WORKERS=<same_workers> PREFETCH=2 \
+RESUME=/data/pub1/z00919662/scene_multilabel/ultraface_slim_8label_640x360_fast_v2/train/last_train_state.pth \
+bash run_train_fast_v2.sh
+```
+
+Do not resume from any V1 checkpoint.
+
+## 12. Final outputs
+
+Expected Fast V2 output files include:
+- metrics.jsonl
+- last_train_state.pth
+- best_train_state.pth
+- best_val_per_class_0p5.csv
+- thresholds.json
+- test_per_class_calibrated.csv
+- test_summary.json
+- best_ultraface_slim_multilabel8_640x360_fast_v2.pth
+
+Final report must include per class:
+- threshold
+- Precision
+- Recall
+- F1
+- Accuracy
+- Balanced Accuracy
+- AP
+- known/positive/negative counts
+
+Aggregate:
+- macro-F1
+- macro-balanced-accuracy
+- macro-AP
+
+Also report:
+- V1 train records
+- V2 train records
+- V1 steps/epoch (~13514 at batch24, verify actual)
+- V2 steps/epoch
+- V1 observed GPU utilization
+- V2 observed samples/s/data_wait/gpu_compute
+- V2 epoch duration
+- estimated total 30-epoch duration based on first completed epoch
+
+## 13. Repository/code failure rule
+
+CodeAgent must NOT modify prepared Python/shell/config files locally.
+
+If a prepared-code bug appears:
+- stop
+- return exact failed command
+- full traceback
+- file
+- line
+- branch
+- commit
+- environment details
+- HUMAN_ACTION_REQUIRED: YES
+
+Do not patch, stash, reset, or commit a local workaround.
+
+## 14. Final status format
+
+Return:
+
+STATUS: PASS / FAIL
+GITHUB_BRANCH:
+GITHUB_COMMIT:
+CONDA_ENV: Ultraface
+TORCH_VERSION:
+GPU:
+
+OLD_V1_PROCESS_STOPPED: YES/NO
+SOURCE_DATA_MODIFIED: NO
+V1_MANIFEST_MODIFIED: NO
+
+V1_TRAIN_RECORDS:
+V2_TRAIN_RECORDS:
+REDUCTION_PERCENT:
+V2_STEPS_PER_EPOCH:
+
+SMOKE_BATCH:
+SMOKE_WORKERS:
+SMOKE_SAMPLES_PER_SEC:
+SMOKE_DATA_WAIT_MS:
+SMOKE_GPU_COMPUTE_MS:
+
+FORMAL_EPOCHS: 30
+FIRST_EPOCH_SECONDS:
+BEST_EPOCH:
+BEST_VAL_MACRO_F1:
+TEST_MACRO_F1:
+TEST_MACRO_BALANCED_ACCURACY:
+TEST_MACRO_AP:
+
+PER_CLASS_TEST_METRICS:
+
+BEST_CHECKPOINT:
+THRESHOLDS_JSON:
+TEST_METRICS_CSV:
+
+HUMAN_ACTION_REQUIRED: YES / NO
