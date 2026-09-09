@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parent / "inference_png_sequence_semantic.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "inference_png_sequence_semantic.py"
 
 
 def load_discovery_functions():
