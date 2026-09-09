@@ -2,6 +2,7 @@
 """Fine-tune RVM on VSPW clips while replaying COCO/ADE13 photographs."""
 
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -15,6 +16,10 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from dataset import (
+    DistillationPreparedStaticTransform,
+    DistillationStaticDataset,
+    DistillationVideoClipDataset,
+    DistillationVideoTrainTransform,
     PreparedStaticTransform,
     StaticSemanticDataset,
     VideoClipDataset,
@@ -22,6 +27,7 @@ from dataset import (
     VideoValidTransform,
     resolve_static_split,
 )
+from distillation.losses import confidence_gated_kd_loss
 from semantic_utils import (
     DEFAULT_CLASS_NAMES,
     ConfusionMatrix,
@@ -90,6 +96,18 @@ def parse_args(argv=None):
     )
     parser.add_argument("--stage2-temporal-weight", type=float, default=0.0)
     parser.add_argument("--stage3-temporal-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-cache-root", type=Path, default=None)
+    parser.add_argument(
+        "--teacher-mapping", type=Path,
+        default=Path("configs/oneformer_ade20k_to_13class.json"),
+    )
+    parser.add_argument("--stage2-kd-weight", type=float, default=0.0)
+    parser.add_argument("--stage3-kd-weight", type=float, default=0.0)
+    parser.add_argument("--kd-temperature", type=float, default=2.0)
+    parser.add_argument("--kd-confidence-threshold", type=float, default=0.60)
+    parser.add_argument("--kd-background-weight", type=float, default=0.25)
+    parser.add_argument("--kd-disagreement-weight", type=float, default=0.25)
+    parser.add_argument("--kd-unsupported-target-ids", default="9")
     parser.add_argument("--temporal-boundary-radius", type=int, default=2)
     parser.add_argument("--temporal-temperature", type=float, default=1.0)
     parser.add_argument("--frame-stride", type=int, default=1)
@@ -158,6 +176,14 @@ def parse_args(argv=None):
         parser.error("--max-frame-gap cannot be negative")
     if args.stage2_temporal_weight < 0 or args.stage3_temporal_weight < 0:
         parser.error("Temporal loss weights cannot be negative")
+    if args.stage2_kd_weight < 0 or args.stage3_kd_weight < 0:
+        parser.error("KD loss weights cannot be negative")
+    if (args.stage2_kd_weight > 0 or args.stage3_kd_weight > 0) and args.teacher_cache_root is None:
+        parser.error("Positive KD weights require --teacher-cache-root")
+    if args.kd_temperature <= 0 or not 0 <= args.kd_confidence_threshold <= 1:
+        parser.error("KD temperature must be positive and confidence threshold must be in [0,1]")
+    if args.kd_background_weight < 0 or args.kd_disagreement_weight < 0:
+        parser.error("KD pixel weights cannot be negative")
     if args.temporal_boundary_radius < 0:
         parser.error("--temporal-boundary-radius cannot be negative")
     if args.temporal_temperature <= 0:
@@ -167,6 +193,14 @@ def parse_args(argv=None):
     # Keep legacy checkpoint consumers compatible while explicitly recording both dimensions.
     args.input_size = args.input_width
     args.epochs = args.stage2_epochs + args.stage3_epochs
+    try:
+        args.kd_unsupported_target_ids = tuple(
+            int(item.strip()) for item in args.kd_unsupported_target_ids.split(",") if item.strip()
+        )
+    except ValueError as error:
+        parser.error(f"Invalid --kd-unsupported-target-ids: {error}")
+    if args.kd_unsupported_target_ids != (9,):
+        parser.error("This fixed ADE20K mapping requires --kd-unsupported-target-ids=9")
     return args
 
 
@@ -179,6 +213,7 @@ def stage_for_epoch(args, epoch):
             "static_batches": args.stage2_static_batches,
             "trainable_scope": getattr(args, "stage2_trainable_scope", "all"),
             "temporal_weight": getattr(args, "stage2_temporal_weight", 0.0),
+            "kd_weight": getattr(args, "stage2_kd_weight", 0.0),
         }
     return {
         "name": "stage3_temporal_finetuning",
@@ -187,6 +222,7 @@ def stage_for_epoch(args, epoch):
         "static_batches": args.stage3_static_batches,
         "trainable_scope": getattr(args, "stage3_trainable_scope", "all"),
         "temporal_weight": getattr(args, "stage3_temporal_weight", 0.0),
+        "kd_weight": getattr(args, "stage3_kd_weight", 0.0),
     }
 
 
@@ -239,6 +275,33 @@ def _subset(dataset, maximum):
     return Subset(dataset, range(min(maximum, len(dataset))))
 
 
+def verify_teacher_cache_manifest(cache_root, image_root, mapping_path, class_names):
+    manifest_path = Path(cache_root) / "MANIFEST.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing teacher cache manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_hash = hashlib.sha256(Path(mapping_path).read_bytes()).hexdigest()
+    expected_root = str(Path(image_root).expanduser().resolve())
+    required = {
+        "format": "oneformer_rvm13_uint8_probability_cache_v1",
+        "teacher_model": "shi-labs/oneformer_ade20k_swin_large",
+        "mapping_sha256": expected_hash,
+        "class_names": class_names,
+        "image_root": expected_root,
+        "status": "complete",
+    }
+    mismatches = {
+        key: {"expected": value, "actual": manifest.get(key)}
+        for key, value in required.items() if manifest.get(key) != value
+    }
+    shape = manifest.get("cache_shape")
+    if not isinstance(shape, list) or len(shape) != 3 or shape[0] != len(class_names):
+        mismatches["cache_shape"] = {"expected": [len(class_names), "H", "W"], "actual": shape}
+    if mismatches:
+        raise ValueError(f"Incompatible teacher cache manifest {manifest_path}: {mismatches}")
+    return manifest
+
+
 def make_loaders(args, stage, num_classes, distributed, rank, world_size):
     manifest_path = args.static_root / args.prepared_static_manifest
     if not manifest_path.is_file():
@@ -258,18 +321,36 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
             f"{args.input_height} fixed 13-class training: {manifest_path}"
         )
     target_size = (args.input_height, args.input_width)
-    train_transform = VideoTrainTransform(
-        target_size,
-        (args.train_scale_min, args.train_scale_max),
-        ignore_index=args.ignore_index,
+    use_distillation = args.teacher_cache_root is not None
+    train_transform = (
+        DistillationVideoTrainTransform(
+            target_size,
+            (args.train_scale_min, args.train_scale_max),
+            ignore_index=args.ignore_index,
+        )
+        if use_distillation else
+        VideoTrainTransform(
+            target_size,
+            (args.train_scale_min, args.train_scale_max),
+            ignore_index=args.ignore_index,
+        )
     )
     valid_transform = VideoValidTransform(target_size, args.val_resize_mode, args.ignore_index)
-    static_train_transform = PreparedStaticTransform(target_size, hflip_probability=0.5)
+    static_train_transform = (
+        DistillationPreparedStaticTransform(target_size, hflip_probability=0.5)
+        if use_distillation else PreparedStaticTransform(target_size, hflip_probability=0.5)
+    )
     static_valid_transform = PreparedStaticTransform(target_size)
     clip_length = stage["clip_length"]
-    train_video = VideoClipDataset(
-        args.data_root / args.train_images,
-        args.data_root / args.train_annotations,
+    video_train_images = args.data_root / args.train_images
+    video_train_annotations = args.data_root / args.train_annotations
+    video_dataset_class = DistillationVideoClipDataset if use_distillation else VideoClipDataset
+    video_dataset_args = {}
+    if use_distillation:
+        video_dataset_args["cache_root"] = args.teacher_cache_root / "vspw" / "train"
+    train_video = video_dataset_class(
+        video_train_images,
+        video_train_annotations,
         num_classes=num_classes,
         clip_length=clip_length,
         frame_stride=args.frame_stride,
@@ -279,6 +360,7 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
         temporal_reverse_probability=args.temporal_reverse_probability,
         minimum_valid_frames=min(2, clip_length),
         max_frame_gap=args.max_frame_gap,
+        **video_dataset_args,
     )
     val_video = VideoClipDataset(
         args.data_root / args.val_images,
@@ -300,11 +382,28 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
     val_paths = resolve_static_split(
         args.static_root, "val", args.static_val_images, args.static_val_annotations
     )
-    train_static = StaticSemanticDataset(
-        train_paths.image_root, train_paths.mask_root, static_train_transform,
-        num_classes=num_classes, ignore_index=args.ignore_index,
-        max_samples=args.max_static_train_images,
-    )
+    if use_distillation:
+        verify_teacher_cache_manifest(
+            args.teacher_cache_root / "vspw" / "train", video_train_images,
+            args.teacher_mapping, DEFAULT_CLASS_NAMES,
+        )
+        verify_teacher_cache_manifest(
+            args.teacher_cache_root / "static" / "train", train_paths.image_root,
+            args.teacher_mapping, DEFAULT_CLASS_NAMES,
+        )
+    if use_distillation:
+        train_static = DistillationStaticDataset(
+            train_paths.image_root, train_paths.mask_root,
+            args.teacher_cache_root / "static" / "train", static_train_transform,
+            num_classes=num_classes, ignore_index=args.ignore_index,
+            max_samples=args.max_static_train_images,
+        )
+    else:
+        train_static = StaticSemanticDataset(
+            train_paths.image_root, train_paths.mask_root, static_train_transform,
+            num_classes=num_classes, ignore_index=args.ignore_index,
+            max_samples=args.max_static_train_images,
+        )
     val_static = StaticSemanticDataset(
         val_paths.image_root, val_paths.mask_root, static_valid_transform,
         num_classes=num_classes, ignore_index=args.ignore_index,
@@ -353,6 +452,7 @@ def make_loaders(args, stage, num_classes, distributed, rank, world_size):
             "input_width": args.input_width,
             "input_height": args.input_height,
             "offline_prepared_static_manifest": str(manifest_path),
+            "teacher_cache_root": str(args.teacher_cache_root) if use_distillation else None,
             "vspw_train_clips": len(train_video),
             "vspw_val_clips": len(val_video),
             "static_train_images": len(train_static),
@@ -399,10 +499,22 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
         "video_samples": 0,
         "static_loss": 0.0,
         "static_samples": 0,
+        "video_kd_loss": 0.0,
+        "static_kd_loss": 0.0,
+        "video_kd_pixels": 0.0,
+        "static_kd_pixels": 0.0,
+        "video_kd_agreement": 0.0,
+        "static_kd_agreement": 0.0,
     }
     progress = tqdm(sources, disable=rank != 0, dynamic_ncols=True, desc=f"Mixed {epoch:03d}")
     for index, source in enumerate(progress):
-        images, masks = next(video_iter if source == "video" else static_iter)
+        batch = next(video_iter if source == "video" else static_iter)
+        if len(batch) == 3:
+            images, masks, teacher_probabilities = batch
+            teacher_probabilities = teacher_probabilities.to(device, non_blocking=True)
+        else:
+            images, masks = batch
+            teacher_probabilities = None
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         with amp_context(args.amp and device.type == "cuda"):
@@ -421,8 +533,27 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
                     boundary_radius=args.temporal_boundary_radius,
                     temperature=args.temporal_temperature,
                 )
+            kd_result = {"loss": logits.sum() * 0.0, "pixels": 0, "agreement": 0.0}
+            if stage["kd_weight"] > 0:
+                if teacher_probabilities is None:
+                    raise RuntimeError("KD is enabled but the training dataset returned no teacher cache")
+                kd_result = confidence_gated_kd_loss(
+                    logits,
+                    teacher_probabilities,
+                    masks,
+                    temperature=args.kd_temperature,
+                    confidence_threshold=args.kd_confidence_threshold,
+                    background_weight=args.kd_background_weight,
+                    disagreement_weight=args.kd_disagreement_weight,
+                    unsupported_target_ids=args.kd_unsupported_target_ids,
+                    ignore_index=args.ignore_index,
+                )
             domain_weight = args.video_loss_weight if source == "video" else args.static_loss_weight
-            objective = losses["total"] + stage["temporal_weight"] * temporal_loss
+            objective = (
+                losses["total"]
+                + stage["temporal_weight"] * temporal_loss
+                + stage["kd_weight"] * kd_result["loss"]
+            )
             loss = objective * domain_weight / args.gradient_accumulation
         scaler.scale(loss).backward()
         if (index + 1) % args.gradient_accumulation == 0 or index + 1 == len(sources):
@@ -436,6 +567,9 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
         count = images.shape[0]
         totals[f"{source}_loss"] += objective.detach().item() * count
         totals[f"{source}_samples"] += count
+        totals[f"{source}_kd_loss"] += kd_result["loss"].detach().item() * count
+        totals[f"{source}_kd_pixels"] += kd_result["pixels"]
+        totals[f"{source}_kd_agreement"] += kd_result["agreement"] * kd_result["pixels"]
         if source == "video":
             totals["video_semantic_loss"] += losses["total"].detach().item() * count
             totals["video_temporal_loss"] += temporal_loss.detach().item() * count
@@ -456,6 +590,12 @@ def train_mixed_epoch(model, loaders, optimizer, scaler, device, epoch, args, st
         "video_temporal_loss": totals["video_temporal_loss"] / max(totals["video_samples"], 1),
         "video_temporal_pixels": int(totals["video_temporal_pixels"]),
         "static_train_loss": totals["static_loss"] / max(totals["static_samples"], 1),
+        "video_kd_loss": totals["video_kd_loss"] / max(totals["video_samples"], 1),
+        "static_kd_loss": totals["static_kd_loss"] / max(totals["static_samples"], 1),
+        "video_kd_pixels": int(totals["video_kd_pixels"]),
+        "static_kd_pixels": int(totals["static_kd_pixels"]),
+        "video_kd_agreement": totals["video_kd_agreement"] / max(totals["video_kd_pixels"], 1),
+        "static_kd_agreement": totals["static_kd_agreement"] / max(totals["static_kd_pixels"], 1),
         "video_train_samples": int(totals["video_samples"]),
         "static_train_samples": int(totals["static_samples"]),
     }
@@ -532,18 +672,24 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, epoch, args, class_n
         "frame_stride": args.frame_stride,
         "video_training": True,
         "mixed_replay_training": True,
+        "oneformer_distillation_training": args.teacher_cache_root is not None,
         "training_stage": stage["name"],
         "baseline_metrics": baseline,
         "args": serialized_args,
     }
 
 
-def load_resume(path, model, optimizer, scheduler, scaler, class_names):
+def load_resume(path, model, optimizer, scheduler, scaler, class_names, require_distillation=False):
     checkpoint = torch_load(path, "cpu")
     if checkpoint.get("class_names") != class_names:
         raise ValueError("Resume checkpoint class mapping does not match the fixed 13 classes")
     if not checkpoint.get("mixed_replay_training"):
         raise ValueError("--resume requires a checkpoint produced by train_vspw_mixed.py")
+    if require_distillation and not checkpoint.get("oneformer_distillation_training"):
+        raise ValueError(
+            "--resume must be a checkpoint from this distillation run; use the trained "
+            "residual-v1 checkpoint with --init-checkpoint instead"
+        )
     model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -579,7 +725,7 @@ def verify_stage1_checkpoint(path, model, class_names):
             f"{None if head_key not in source else tuple(source[head_key].shape)}"
         )
     source_names = checkpoint.get("class_names") if isinstance(checkpoint, dict) else None
-    if source_names and (len(source_names) != len(class_names) or set(source_names) != set(class_names)):
+    if source_names and source_names != class_names:
         raise ValueError(f"Initial checkpoint has a different semantic taxonomy: {source_names}")
     if ratio < 0.8:
         raise ValueError(
@@ -610,6 +756,7 @@ def main(argv=None):
             "class_names": class_names, "device": str(device), "world_size": world_size,
             "stage2_epochs": args.stage2_epochs, "stage3_epochs": args.stage3_epochs,
             "input_width": args.input_width, "input_height": args.input_height,
+            "teacher_cache_root": str(args.teacher_cache_root) if args.teacher_cache_root else None,
             "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
             "resume": str(args.resume) if args.resume else None,
         }, indent=2))
@@ -628,7 +775,8 @@ def main(argv=None):
     start_epoch, baseline = 0, None
     if args.resume:
         start_epoch, records, baseline = load_resume(
-            args.resume, model, optimizer, scheduler, scaler, class_names
+            args.resume, model, optimizer, scheduler, scaler, class_names,
+            require_distillation=args.teacher_cache_root is not None,
         )
     initial_trainable = configure_trainable_scope(
         model, stage_for_epoch(args, min(start_epoch, args.epochs - 1))["trainable_scope"]
@@ -727,6 +875,7 @@ def main(argv=None):
                 f"balanced={score:.4f}, retained={retained}, "
                 f"prediction_flip_rate_on_stable_gt={prediction_flip_rate:.6f}, "
                 f"scope={stage['trainable_scope']}, temporal_weight={stage['temporal_weight']:.4f}, "
+                f"kd_weight={stage['kd_weight']:.4f}, "
                 f"time={time.time() - started:.1f}s"
             )
             append_metrics_csv(args.output_dir / "metrics.csv", {

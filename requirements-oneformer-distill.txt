@@ -1,0 +1,4 @@
+-r requirements.txt
+transformers>=4.38,<5
+scipy>=1.10
+safetensors>=0.4

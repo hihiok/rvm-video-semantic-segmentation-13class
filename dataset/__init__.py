@@ -14,3 +14,9 @@ from .static_semantic import (
     discover_static_pairs,
     resolve_static_split,
 )
+from .distillation import (
+    DistillationPreparedStaticTransform,
+    DistillationStaticDataset,
+    DistillationVideoClipDataset,
+    DistillationVideoTrainTransform,
+)

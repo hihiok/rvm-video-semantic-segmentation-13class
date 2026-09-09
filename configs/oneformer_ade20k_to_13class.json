@@ -1,0 +1,30 @@
+{
+  "format": "oneformer_ade20k_to_rvm13_v1",
+  "teacher_model": "shi-labs/oneformer_ade20k_swin_large",
+  "source_num_classes": 150,
+  "target_class_names": [
+    "background", "sky", "person", "plant", "building", "flower", "food",
+    "water", "desert", "ice_or_snow", "text", "ball", "mountain"
+  ],
+  "target_to_source_ids": {
+    "sky": [2],
+    "person": [12],
+    "plant": [4, 9, 17, 29, 72],
+    "building": [1, 25, 48, 79, 84],
+    "flower": [66],
+    "food": [121],
+    "water": [21, 26, 60, 104, 109, 113, 128],
+    "desert": [46],
+    "ice_or_snow": [],
+    "text": [43, 100, 145],
+    "ball": [120],
+    "mountain": [16, 68]
+  },
+  "unmapped_source_policy": "background",
+  "unsupported_target_ids": [9],
+  "notes": [
+    "ADE20K has no reliable ice_or_snow class; ground-truth class 9 pixels are excluded from KD.",
+    "Text is intentionally strict: signboard, poster and bulletin board only.",
+    "Mountain combines ADE20K mountain and hill. All unlisted ADE20K classes map to background."
+  ]
+}

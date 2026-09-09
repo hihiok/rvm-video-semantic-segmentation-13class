@@ -108,6 +108,48 @@ Cityscapes-VPS and KITTI-STEP are real video segmentation datasets, but are driv
 
 ## Training
 
+### OneFormer soft-label distillation from the trained RVM13 checkpoint
+
+The student remains the recurrent MobileNetV3 RVM (3,747,961 parameters). The
+teacher is pinned to `shi-labs/oneformer_ade20k_swin_large`; only training uses
+the teacher, so exported student inference has no Transformers dependency.
+
+Distillation starts from the trained residual-v1 RVM13 run under:
+
+```text
+/data/pub1/z00919662/segmentation/rvm-video-semantic-segmentation-13class-rvm-residual-v1/output/rvm_vspw_rvm_residual_v1_13class_640x360
+```
+
+`tools/select_distillation_checkpoint.py` validates the exact class order and
+13-channel head, then chooses `best_spatial_preserved.pth` first. It considers
+other named `best_*.pth` files only inside that directory and never silently
+uses `last.pth`, random initialization, or a checkpoint from another project.
+
+Generate the resumable uint8 soft-probability cache and then train:
+
+```bash
+python -m pip install -r requirements-oneformer-distill.txt
+bash scripts/cache_oneformer_teacher.sh
+bash scripts/train_oneformer_distill.sh
+```
+
+The audited ADE20K-to-13 mapping is in
+`configs/oneformer_ade20k_to_13class.json`. KD uses confidence-gated pixel KL,
+downweights background and teacher/GT disagreement, and completely excludes GT
+`ice_or_snow` pixels because ADE20K has no reliable matching class. Supervised
+CE+Dice and temporal consistency remain active, which protects the existing
+RVM behavior from teacher taxonomy errors.
+
+Compute can be checked without OneFormer weights:
+
+```bash
+python tools/profile_student.py
+```
+
+The report shows both direct convolution MAC/FLOP counting and the established
+RVM table convention (90.0G at 1920×1080), avoiding ambiguity about whether one
+MAC is counted as one or two operations.
+
 ### COCO+ADE13 initialization and VSPW mixed video fine-tuning
 
 `train_vspw_mixed.py` starts from an already-trained **13-class** image model and
