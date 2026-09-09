@@ -26,6 +26,9 @@ from model import MultiClassFastGuidedFilterRefiner, RVMForVideoSemanticSegmenta
 from semantic_utils import DEFAULT_CLASS_NAMES, torch_load
 
 
+OTHER_CLASS_NAME = "other"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -47,6 +50,49 @@ def parse_args():
     parser.add_argument("--guided-radius", type=int, default=1)
     parser.add_argument("--guided-eps", type=float, default=1e-4)
     parser.add_argument("--recurrent", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--output-classes",
+        nargs="+",
+        default=None,
+        metavar="CLASS",
+        help=(
+            "Limit the output to named checkpoint classes. Add 'other' to keep a "
+            "catch-all label; for example: sky water mountain other."
+        ),
+    )
+    parser.add_argument(
+        "--restricted-min-confidence",
+        type=float,
+        default=0.20,
+        help=(
+            "With 'other' enabled, assign a pixel to its best requested class only "
+            "when that class reaches this probability; otherwise emit other."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-ema-alpha",
+        type=float,
+        default=1.0,
+        help=(
+            "Current-frame weight for probability EMA. 1 disables EMA; values such "
+            "as 0.20-0.30 give strong, inexpensive temporal smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-hysteresis-margin",
+        type=float,
+        default=0.0,
+        help=(
+            "Extra probability advantage required before a pixel changes label. "
+            "0 disables hysteresis; 0.05-0.10 is a useful stable range."
+        ),
+    )
+    parser.add_argument(
+        "--scene-cut-method",
+        choices=("histogram", "gray"),
+        default="histogram",
+        help="Histogram is robust to object/camera motion; gray preserves legacy behavior.",
+    )
     parser.add_argument("--scene-cut-threshold", type=float, default=0.35)
     parser.add_argument("--reset-interval", type=int, default=0)
     parser.add_argument("--save-masks", action="store_true")
@@ -89,8 +135,178 @@ def read_frame(path):
     return frame
 
 
+def resolve_output_classes(requested, class_names):
+    """Resolve a user-facing class list while retaining checkpoint class IDs."""
+    if requested is None:
+        return None
+
+    normalized = [name.strip().lower() for name in requested]
+    if not normalized or any(not name for name in normalized):
+        raise ValueError("--output-classes must contain at least one class name")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"Duplicate --output-classes are not allowed: {requested}")
+
+    include_other = OTHER_CLASS_NAME in normalized
+    selected_names = [name for name in normalized if name != OTHER_CLASS_NAME]
+    if not selected_names:
+        raise ValueError("--output-classes cannot contain only 'other'")
+
+    name_to_index = {name.lower(): index for index, name in enumerate(class_names)}
+    unknown = [name for name in selected_names if name not in name_to_index]
+    if unknown:
+        raise ValueError(
+            f"Unknown output classes {unknown}; available classes: {class_names}, other"
+        )
+
+    selected_indices = [name_to_index[name] for name in selected_names]
+    if include_other and 0 in selected_indices:
+        raise ValueError(
+            "'background' and 'other' cannot be requested together because both use "
+            "output mask ID 0"
+        )
+    return {
+        "requested": normalized,
+        "selected_names": selected_names,
+        "selected_indices": selected_indices,
+        "include_other": include_other,
+    }
+
+
+def histogram_scene_cut_score(previous_histogram, frame):
+    """Return a [0, 1] HSV histogram distance and the current frame histogram."""
+    thumbnail = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2HSV)
+    histogram = cv2.calcHist(
+        [hsv], [0, 1, 2], None, [24, 16, 16], [0, 180, 0, 256, 0, 256]
+    )
+    histogram = cv2.normalize(
+        histogram, None, alpha=1.0, norm_type=cv2.NORM_L1
+    ).astype(np.float32)
+    if previous_histogram is None:
+        return None, histogram
+    score = cv2.compareHist(
+        previous_histogram, histogram, cv2.HISTCMP_BHATTACHARYYA
+    )
+    return float(np.clip(score, 0.0, 1.0)), histogram
+
+
+def update_probability_ema(current_probabilities, previous_probabilities, alpha):
+    if previous_probabilities is None or alpha >= 1.0:
+        return current_probabilities
+    return (
+        alpha * current_probabilities
+        + (1.0 - alpha) * previous_probabilities
+    )
+
+
+def unrestricted_mask_from_probabilities(probabilities, previous_mask=None, margin=0.0):
+    confidence, candidate = probabilities.max(dim=1)
+    if previous_mask is None or margin <= 0:
+        return candidate
+    previous_confidence = probabilities.gather(
+        1, previous_mask.unsqueeze(1).long()
+    ).squeeze(1)
+    keep_previous = (
+        candidate.ne(previous_mask)
+        & confidence.lt(previous_confidence + margin)
+    )
+    return torch.where(keep_previous, previous_mask, candidate)
+
+
+def restricted_mask_from_probabilities(
+    probabilities,
+    output_spec,
+    min_confidence,
+    previous_mask=None,
+    margin=0.0,
+):
+    """Map probabilities to retained source IDs plus optional ID-0 other."""
+    selected_indices = output_spec["selected_indices"]
+    index_tensor = torch.as_tensor(
+        selected_indices, device=probabilities.device, dtype=torch.long
+    )
+    selected = probabilities.index_select(1, index_tensor)
+    best_confidence, best_position = selected.max(dim=1)
+    candidate = index_tensor[best_position]
+
+    if output_spec["include_other"]:
+        candidate = torch.where(
+            best_confidence.ge(min_confidence), candidate, torch.zeros_like(candidate)
+        )
+    if previous_mask is None or margin <= 0:
+        return candidate
+
+    same = candidate.eq(previous_mask)
+    switch = same.clone()
+    previous_is_other = previous_mask.eq(0) & output_spec["include_other"]
+    candidate_is_other = candidate.eq(0) & output_spec["include_other"]
+
+    # Enter/leave other with two different thresholds to avoid rapid toggling.
+    switch |= (
+        previous_is_other
+        & ~candidate_is_other
+        & best_confidence.ge(min(1.0, min_confidence + margin))
+    )
+    switch |= (
+        ~previous_is_other
+        & candidate_is_other
+        & best_confidence.lt(max(0.0, min_confidence - margin))
+    )
+
+    # Between two retained semantic classes, require a real confidence advantage.
+    both_selected = ~previous_is_other & ~candidate_is_other & ~same
+    safe_previous = previous_mask.clamp(0, probabilities.shape[1] - 1).long()
+    previous_confidence = probabilities.gather(
+        1, safe_previous.unsqueeze(1)
+    ).squeeze(1)
+    switch |= (
+        both_selected
+        & best_confidence.ge(previous_confidence + margin)
+    )
+    return torch.where(switch, candidate, previous_mask)
+
+
+def output_mask_from_probabilities(
+    probabilities,
+    output_spec,
+    min_confidence,
+    previous_mask=None,
+    margin=0.0,
+):
+    if output_spec is None:
+        return unrestricted_mask_from_probabilities(
+            probabilities, previous_mask, margin
+        )
+    return restricted_mask_from_probabilities(
+        probabilities,
+        output_spec,
+        min_confidence,
+        previous_mask,
+        margin,
+    )
+
+
+def output_class_ratios(mask, class_names, output_spec):
+    counts = np.bincount(mask.reshape(-1), minlength=len(class_names))
+    if output_spec is None:
+        return {
+            name: float(counts[index] / mask.size)
+            for index, name in enumerate(class_names)
+        }
+    ratios = {}
+    if output_spec["include_other"]:
+        ratios[OTHER_CLASS_NAME] = float(counts[0] / mask.size)
+    for name, index in zip(
+        output_spec["selected_names"], output_spec["selected_indices"]
+    ):
+        ratios[name] = float(counts[index] / mask.size)
+    return ratios
+
+
 @torch.inference_mode()
-def process_sequence(args, model, class_names, input_size, guided_refiner=None):
+def process_sequence(
+    args, model, class_names, input_size, output_spec, guided_refiner=None
+):
     frame_paths = find_png_frames(args.input_dir)
     if args.max_frames > 0:
         frame_paths = frame_paths[: args.max_frames]
@@ -113,10 +329,18 @@ def process_sequence(args, model, class_names, input_size, guided_refiner=None):
     stats_path = output_path.with_suffix(".jsonl")
 
     recurrence = [None] * 4
-    previous_gray = None
+    previous_scene_signature = None
+    previous_ema_probabilities = None
+    previous_raw_mask_lowres = None
+    previous_stable_mask_lowres = None
+    previous_output_mask = None
     reset_count = 0
+    scene_cut_reset_count = 0
     network_seconds = 0.0
     upsample_seconds = 0.0
+    raw_flip_sum = 0.0
+    stable_flip_sum = 0.0
+    flip_transition_count = 0
     processed = 0
 
     try:
@@ -131,17 +355,23 @@ def process_sequence(args, model, class_names, input_size, guided_refiner=None):
                         f"{frame.shape[1]}x{frame.shape[0]} versus {width}x{height}"
                     )
 
-                cut_score, current_gray = scene_cut_score(previous_gray, frame)
+                if args.scene_cut_method == "histogram":
+                    cut_score, current_scene_signature = histogram_scene_cut_score(
+                        previous_scene_signature, frame
+                    )
+                else:
+                    cut_score, current_scene_signature = scene_cut_score(
+                        previous_scene_signature, frame
+                    )
                 reset_reason = None
                 if (
-                    args.recurrent
-                    and args.scene_cut_threshold > 0
+                    args.scene_cut_threshold > 0
                     and cut_score is not None
                     and cut_score > args.scene_cut_threshold
                 ):
                     reset_reason = "scene_cut"
                 if (
-                    args.recurrent
+                    reset_reason is None
                     and args.reset_interval > 0
                     and frame_index > 0
                     and frame_index % args.reset_interval == 0
@@ -149,8 +379,14 @@ def process_sequence(args, model, class_names, input_size, guided_refiner=None):
                     reset_reason = "interval"
                 if reset_reason:
                     recurrence = [None] * 4
+                    previous_ema_probabilities = None
+                    previous_raw_mask_lowres = None
+                    previous_stable_mask_lowres = None
+                    previous_output_mask = None
                     reset_count += 1
-                previous_gray = current_gray
+                    if reset_reason == "scene_cut":
+                        scene_cut_reset_count += 1
+                previous_scene_signature = current_scene_signature
 
                 tensor, geometry = prepare_frame(frame, input_size, args.resize_mode)
                 tensor = tensor.to(args.device, non_blocking=True)
@@ -165,24 +401,77 @@ def process_sequence(args, model, class_names, input_size, guided_refiner=None):
                 recurrence = new_recurrence if args.recurrent else [None] * 4
 
                 upsample_started = time.perf_counter()
+                current_probabilities = torch.softmax(logits.float(), dim=1)
+                ema_probabilities = update_probability_ema(
+                    current_probabilities,
+                    previous_ema_probabilities,
+                    args.temporal_ema_alpha,
+                )
+                raw_mask_lowres = output_mask_from_probabilities(
+                    current_probabilities,
+                    output_spec,
+                    args.restricted_min_confidence,
+                )
+                stable_mask_lowres = output_mask_from_probabilities(
+                    ema_probabilities,
+                    output_spec,
+                    args.restricted_min_confidence,
+                    previous_stable_mask_lowres,
+                    args.temporal_hysteresis_margin,
+                )
+                raw_flip_ratio = None
+                stable_flip_ratio = None
+                if previous_raw_mask_lowres is not None:
+                    raw_flip_ratio = float(
+                        raw_mask_lowres.ne(previous_raw_mask_lowres).float().mean().item()
+                    )
+                    stable_flip_ratio = float(
+                        stable_mask_lowres.ne(previous_stable_mask_lowres)
+                        .float()
+                        .mean()
+                        .item()
+                    )
+                    raw_flip_sum += raw_flip_ratio
+                    stable_flip_sum += stable_flip_ratio
+                    flip_transition_count += 1
+
                 if args.upsample_mode == "mask_nearest":
-                    mask = logits.argmax(dim=1)[0].byte().cpu().numpy()
+                    mask = stable_mask_lowres[0].byte().cpu().numpy()
                     mask = restore_mask(mask, width, height, geometry)
                 else:
-                    restored_logits = restore_logits(
-                        logits, tensor, frame, geometry, args.upsample_mode, guided_refiner
+                    restored_probabilities = restore_logits(
+                        ema_probabilities,
+                        tensor,
+                        frame,
+                        geometry,
+                        args.upsample_mode,
+                        guided_refiner,
                     )
-                    mask = restored_logits.argmax(dim=1)[0].byte().cpu().numpy()
+                    output_mask = output_mask_from_probabilities(
+                        restored_probabilities,
+                        output_spec,
+                        args.restricted_min_confidence,
+                        previous_output_mask,
+                        args.temporal_hysteresis_margin,
+                    )
+                    previous_output_mask = output_mask
+                    mask = output_mask[0].byte().cpu().numpy()
                 if tensor.is_cuda:
                     torch.cuda.synchronize(tensor.device)
                 upsample_seconds += time.perf_counter() - upsample_started
+                previous_ema_probabilities = ema_probabilities
+                previous_raw_mask_lowres = raw_mask_lowres
+                previous_stable_mask_lowres = stable_mask_lowres
 
                 color_rgb = colorize(mask)
                 color_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
                 overlay = cv2.addWeighted(
                     frame, 1 - args.overlay_alpha, color_bgr, args.overlay_alpha, 0
                 )
-                writer.write(add_legend(overlay, mask, class_names))
+                display_class_names = list(class_names)
+                if output_spec is not None and output_spec["include_other"]:
+                    display_class_names[0] = OTHER_CLASS_NAME
+                writer.write(add_legend(overlay, mask, display_class_names))
 
                 if args.save_masks:
                     cv2.imwrite(str(mask_dir / f"{frame_index:06d}.png"), mask)
@@ -190,17 +479,18 @@ def process_sequence(args, model, class_names, input_size, guided_refiner=None):
                     cv2.imwrite(
                         str(mask_dir / f"{frame_index:06d}_color.png"), color_bgr
                     )
-                counts = np.bincount(mask.reshape(-1), minlength=len(class_names))
                 stats_file.write(json.dumps({
                     "frame": frame_index,
                     "source": str(frame_path),
                     "time_seconds": frame_index / args.fps,
                     "scene_cut_score": cut_score,
+                    "scene_cut_method": args.scene_cut_method,
                     "state_reset": reset_reason,
-                    "class_pixel_ratio": {
-                        name: float(counts[index] / mask.size)
-                        for index, name in enumerate(class_names)
-                    },
+                    "raw_flip_ratio_lowres": raw_flip_ratio,
+                    "stabilized_flip_ratio_lowres": stable_flip_ratio,
+                    "output_class_pixel_ratio": output_class_ratios(
+                        mask, class_names, output_spec
+                    ),
                 }) + "\n")
                 processed += 1
     finally:
@@ -216,6 +506,20 @@ def process_sequence(args, model, class_names, input_size, guided_refiner=None):
         "preview_fps": args.fps,
         "recurrent": args.recurrent,
         "state_resets": reset_count,
+        "scene_cut_resets": scene_cut_reset_count,
+        "scene_cut_method": args.scene_cut_method,
+        "scene_cut_threshold": args.scene_cut_threshold,
+        "output_classes": (
+            list(class_names) if output_spec is None else output_spec["requested"]
+        ),
+        "restricted_min_confidence": args.restricted_min_confidence,
+        "temporal_ema_alpha": args.temporal_ema_alpha,
+        "temporal_hysteresis_margin": args.temporal_hysteresis_margin,
+        "raw_flip_rate_lowres": raw_flip_sum / max(flip_transition_count, 1),
+        "stabilized_flip_rate_lowres": (
+            stable_flip_sum / max(flip_transition_count, 1)
+        ),
+        "flip_transitions_measured": flip_transition_count,
         "upsample_mode": args.upsample_mode,
         "network_ms_per_frame": 1000.0 * network_seconds / max(processed, 1),
         "upsample_ms_per_frame": 1000.0 * upsample_seconds / max(processed, 1),
@@ -237,6 +541,12 @@ def main():
         raise ValueError("--overlay-alpha must be in [0,1]")
     if args.guided_radius < 1 or args.guided_eps <= 0:
         raise ValueError("Guided radius must be >=1 and epsilon must be positive")
+    if not 0 <= args.restricted_min_confidence <= 1:
+        raise ValueError("--restricted-min-confidence must be in [0,1]")
+    if not 0 < args.temporal_ema_alpha <= 1:
+        raise ValueError("--temporal-ema-alpha must be in (0,1]")
+    if not 0 <= args.temporal_hysteresis_margin <= 1:
+        raise ValueError("--temporal-hysteresis-margin must be in [0,1]")
 
     checkpoint = torch_load(args.checkpoint, "cpu")
     class_names = list(checkpoint.get("class_names", DEFAULT_CLASS_NAMES))
@@ -244,6 +554,7 @@ def main():
         raise ValueError(
             f"Checkpoint class mapping is not the fixed 13-class mapping: {class_names}"
         )
+    output_spec = resolve_output_classes(args.output_classes, class_names)
     input_size = resolve_input_shape(args, checkpoint)
     print(f"Inference input resolution: {input_size[1]}x{input_size[0]}")
     model = RVMForVideoSemanticSegmentation(
@@ -261,7 +572,9 @@ def main():
         guided_refiner = MultiClassFastGuidedFilterRefiner(
             args.guided_radius, args.guided_eps
         ).eval().to(args.device)
-    process_sequence(args, model, class_names, input_size, guided_refiner)
+    process_sequence(
+        args, model, class_names, input_size, output_spec, guided_refiner
+    )
 
 
 if __name__ == "__main__":
