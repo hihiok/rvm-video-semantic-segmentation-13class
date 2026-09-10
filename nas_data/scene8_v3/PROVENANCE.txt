@@ -1,0 +1,9 @@
+places365_io.txt is copied byte-for-byte from CSAILVision/places365 IO_places365.txt.
+Source: https://github.com/CSAILVision/places365/blob/master/IO_places365.txt
+Git blob SHA1: 6e111935c0524f3d0b26f62c71445bfacc5a0fe2
+No numeric class-index reconstruction is used for Places folders.
+NUS format source: NExTplusplus/NUS-WIDE README, native Groundtruth files and matching ImageList.
+MIR source: official MIRFLICKR25K v080 manual concept ID lists and original archive README.
+User's product definitions and reported example corrections are recorded in policy.py.
+All source-derived category mappings marked weak are NOT per-image manual labels.
+Code implementation is independent of the old FSD and of any model inference.
