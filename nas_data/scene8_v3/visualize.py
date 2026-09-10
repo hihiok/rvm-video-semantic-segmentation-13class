@@ -33,6 +33,9 @@ def select100(rows,seed):
     rng=random.Random(seed);chosen=[];seen=set()
     for source,count in QUOTAS.items():
         rs=[r for r in rows if r['source']==source];rng.shuffle(rs)
+        # Keep review representative when a source (e.g. NUS21) has many rows
+        # without any target supervision. The shuffle remains seeded within tiers.
+        rs.sort(key=lambda r:not r['use_for_training_manifest'])
         prioritized=[r for r in rs if Path(r['image']).name in REPORTED]
         for label in LABELS:
             prioritized += [r for r in rs if r['labels'][label]==1][:2]

@@ -1,6 +1,6 @@
 # NAS 八类新数据合并、旧 GT 修复、100 张 GT 可视化 — V3
 
-Rev2 更新：已遇到 people_r1 / NUS 检索格式阻塞的服务器，先执行仓库根目录 CODEAGENT_NAS8_SOURCE_PREFLIGHT_REV2.md；不要直接重复全量准备。
+Rev3 更新：已核验用户上传的 NUS21 检索元数据。此次继续任务以 CODEAGENT_NAS8_NUS21_CONTINUE_REV3.md 为准，不再执行 Rev2 诊断等待流程。
 
 本文件供新的 CodeAgent chat 执行，只做数据准备，不启动/停止训练，不改模型、阈值、watchdog。
 
@@ -75,7 +75,7 @@ export MIR_IMAGES="/data/pub1/z00919662/dataset/mirflickr25k.zip"
 export MIR_ANN="/data/pub1/z00919662/dataset/mirflickr25k_annotations_v080.zip"
 export NUS_ZIP="/data/pub1/z00919662/dataset/archive.zip"
 export CACHE_ROOT="/data/pub1/z00919662/dataset/NAS8_new_sources_raw_v3"
-export NEW_LABEL_ROOT="/data/pub1/z00919662/dataset/NAS8_multilabel_clean_v3_rev2"
+export NEW_LABEL_ROOT="/data/pub1/z00919662/dataset/NAS8_multilabel_clean_v3_rev3"
 ```
 
 旧来源只读根目录：
@@ -95,7 +95,7 @@ find /data/pub1/z00919662/dataset -maxdepth 3 -type f -name mirflickr25k.zip -pr
 
 找到唯一文件后，只改 `MIR_IMAGES` 运行变量；有多个文件不能猜，报告给用户。禁止重下载。
 
-NUS 的 `archive.zip` 文件名不能证明内部布局。脚本先保存目录清单再解析，只支持可核验的官方 Groundtruth + ImageList：
+NUS 的 `archive.zip` 文件名不能证明内部布局。脚本先保存目录清单再解析，支持下面两类已核验输入：Rev3 的六文件 SHA256 固定 NUS21 检索包（只提供 snow 正例），以及官方 Groundtruth + ImageList：
 
 - `TrainImagelist.txt / TestImagelist.txt` + `Labels_<concept>_Train.txt / ..._Test.txt`；
 - 或 `Imagelist.txt` + `Labels_<concept>.txt`；
@@ -116,11 +116,11 @@ export PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 python -c 'import sys,PIL; print(sys.version);print("Pillow",PIL.__version__)'
 cd "$PROJECT_ROOT/nas_data/scene8_v3"
-python test_pipeline.py
+python -m unittest test_pipeline test_nus21
 bash -n run_prepare.sh
 ```
 
-28 项离线测试必须通过，网络请求/torch/GPU 不参与测试。不要把测试合成图当成真实 GT100 结果。
+38 项离线测试必须通过，网络请求/torch/GPU 不参与测试。不要把测试合成图当成真实 GT100 结果。
 
 检查源 ZIP 和旧三份 JSONL 存在：
 
@@ -160,7 +160,7 @@ bash run_prepare.sh \
 
 ### 夜景
 
-MIR night 与 NUS nighttime 提供真实照片正负监督；MIR potential/r1 单独处理。旧 Places/COCO/SEG 不再自动给 night 正负。10_scenes 夜景 folder 可提供弱正样本，其他 folder 不自动当夜景负样本。真实照片负样本数量单独统计，不把 Computer_synthesized 的负样本算进去。
+MIR night 提供真实照片正负监督；官方81类 NUS 可提供 nighttime，但用户当前21类检索包没有 nighttime，须保留 unknown；MIR potential/r1 单独处理。旧 Places/COCO/SEG 不再自动给 night 正负。10_scenes 夜景 folder 可提供弱正样本，其他 folder 不自动当夜景负样本。真实照片负样本数量单独统计，不把 Computer_synthesized 的负样本算进去。
 
 ### 雨/雪
 
@@ -178,7 +178,7 @@ NUS snow=1 ->1，snow=0 ->unknown。MIR 不提供雨雪。
 
 ### 运动、办公、室内/户外
 
-NUS 原生 sports 0/1 可用；sports=0 与 soccer/running 等子类正样本冲突时设unknown。Places 体育场景/活动可提供弱正；不再将 river/beach/mountain 等一律设运动负。
+仅官方81类 NUS 原生 sports 0/1 可用；当前21类检索包无 sports，须保留 unknown。sports=0 与 soccer/running 等子类正样本冲突时设unknown。Places 体育场景/活动可提供弱正；不再将 river/beach/mountain 等一律设运动负。
 
 office/home_office/office_cubicles/conference_room 为办公弱正；computer_room/reception/conference_center 不直接等于办公，保留unknown。它们仍可补客观图的真实困难负样本。
 

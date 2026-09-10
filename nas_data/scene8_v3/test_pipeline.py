@@ -155,7 +155,7 @@ class Formats(unittest.TestCase):
             root=Path(t);make_image(root/'x.jpg',1)
             (root/'database_img.txt').write_text('x.jpg\n')
             (root/'database_label.txt').write_text('0 2 20\n')
-            with self.assertRaisesRegex(s.Blocked,'NUS_RETRIEVAL_MAPPING_UNVERIFIED'):
+            with self.assertRaises(s.Blocked):
                 a.nus_rows(root,42,{},[])
 
     def test_diagnostic_bundle_preserves_rows_and_has_no_images(self):

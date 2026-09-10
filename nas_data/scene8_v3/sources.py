@@ -72,6 +72,9 @@ def nus_rows(root,seed,audit,excluded,metadata_root=None):
     concepts=lookup('Concepts81.txt',True)
     if concepts is None:
         retrieval=any(k in files for k in ('database_label.txt','test_label.txt','targets_tc10.txt'))
+        if 'database_label.txt' in files:
+            from nus21 import top21_rows
+            return top21_rows(index,lookup,seed,audit,excluded,split_hash)
         raise Blocked('NUS_RETRIEVAL_MAPPING_UNVERIFIED: numeric retrieval labels are not the official 81-concept GT. Return nus_diagnostics.zip for ChatGPT to verify README/class mapping; do not invent indices or negatives.' if retrieval else 'NUS official Concepts81.txt missing; return nus_diagnostics.zip')
     names=[s.strip() for s in concepts.read_text(encoding='utf-8-sig').splitlines() if s.strip()]
     if len(names)!=81 or len(set(names))!=81 or not {'nighttime','sports','snow'}<=set(names):raise Blocked('NUS Concepts81 invalid or wrong dataset')

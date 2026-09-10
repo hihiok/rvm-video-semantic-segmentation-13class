@@ -1,5 +1,7 @@
 # NAS8 MIR 修复与 NUS 源数据预检 — Rev2
 
+历史流程：用户诊断包已于 Rev3 核验。当前继续执行 CODEAGENT_NAS8_NUS21_CONTINUE_REV3.md，不再按本文件预期阻塞。
+
 本轮承接 c418fd557f0c7560379403096e4c14f7ac3eabce 的 BLOCKED 报告。
 ChatGPT 已修复 MIR relevance 子集假设；NUS 数值索引与类别名称尚无已核验映射，
 本版不声称已支持这个检索包。先从现有 cache 导出实际元数据，不能凭列数造 GT。

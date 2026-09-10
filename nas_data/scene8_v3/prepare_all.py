@@ -63,8 +63,13 @@ def main():
     p.add_argument('--source-roots',nargs=4,type=Path,default=[BASE/'segmentation/datasets/coco',BASE/'segmentation/datasets/places365',BASE/'segmentation/datasets/COCO_ADE_13cls_16x9_640x360',BASE/'dataset/10_scenes'])
     a=p.parse_args();out=a.output_root.resolve();cache=a.cache_root.resolve()
     protected=[a.old_root.resolve()]+[x.resolve() for x in a.source_roots]
-    if a.nus_root:protected.append(a.nus_root.resolve())
-    if a.nus_metadata_root:protected.append(a.nus_metadata_root.resolve())
+    # A reused NUS source may be cache/nus. The cache can contain that source,
+    # but must not be created inside the read-only NUS source itself.
+    for extra in (a.nus_root,a.nus_metadata_root):
+        if extra is None:continue
+        v=extra.resolve()
+        if out==v or v in out.parents or out in v.parents or cache==v or v in cache.parents:
+            raise Blocked('Output/cache overlaps a read-only NUS input')
     if any(out==v or v in out.parents or out in v.parents or cache==v or v in cache.parents or cache in v.parents for v in protected):raise Blocked('Output/cache overlaps a source or old manifest root')
     if out==cache or out in cache.parents or cache in out.parents:raise Blocked('Keep cache and derived output as sibling directories')
     if out.exists():raise Blocked('Output already exists, do not overwrite. Choose a new --output-root: '+str(out))
@@ -154,7 +159,9 @@ def main():
         dump(out/'source_audit.json',audit)
         for split,meta in audit['old_manifest_files'].items():
             if sha(meta['path'])!=meta['sha256']:raise Blocked('Old manifest changed externally during run: '+meta['path'])
-        summary={'status':'PREPARED_REVIEW_REQUIRED','schema':'nas8_source_curation_v3','labels':LABELS,
+        summary={'status':'PREPARED_REVIEW_REQUIRED','schema':'nas8_source_curation_v3_rev3','labels':LABELS,
+            'nus_format':audit.get('NUS_WIDE',{}).get('format','native_official'),
+            'nus_target_supervision':audit.get('NUS_WIDE',{}).get('target_supervision','native nighttime/sports/snow'),
             'source_observations':len(rows),'source_counts':dict(Counter(r['source'] for r in rows)),
             'splits':counts,'excluded_reasons':dict(Counter(r['reason'] for r in excluded)),
             'new_split_group_overlap':overlap,'training_quality_blockers':blocks,

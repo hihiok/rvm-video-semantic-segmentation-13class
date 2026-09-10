@@ -1,0 +1,124 @@
+{
+  "schema": "nus21_pinned_profile_v1",
+  "width": 21,
+  "class_names": [
+    "sky",
+    "clouds",
+    "person",
+    "water",
+    "animal",
+    "grass",
+    "buildings",
+    "window",
+    "plants",
+    "lake",
+    "ocean",
+    "road",
+    "flowers",
+    "sunset",
+    "reflection",
+    "rocks",
+    "vehicle",
+    "snow",
+    "tree",
+    "beach",
+    "mountain"
+  ],
+  "files": {
+    "database_img.txt": {
+      "sha256": "9b9024c97341abc2d02c181af6ea344b2f5036c5e24903acf9ec4519265ab7e6",
+      "bytes": 5113194
+    },
+    "database_label_onehot.txt": {
+      "sha256": "bacbd4414e9929c11923b43a0f823037c1c9380e7d1af3f5697ca9908ad4e81b",
+      "bytes": 8330562
+    },
+    "database_label.txt": {
+      "sha256": "8fcc4ffaf5f677f1cfb6a0801e1cd85803169e33a1f36c1a72660235d4ebb72c",
+      "bytes": 1079579
+    },
+    "test_img.txt": {
+      "sha256": "a1966774165da8db56c05b0ea4f8f2353ea20fe0225d7414573ce43ee3080ba6",
+      "bytes": 55394
+    },
+    "test_label_onehot.txt": {
+      "sha256": "5c5ed44f68635ffc3797663dc2c3af7fc956ce4f19b9651ea0cee15396a4b5f3",
+      "bytes": 90300
+    },
+    "test_label.txt": {
+      "sha256": "4d4a65e7501cb09289d5a7ac7fcc61d03719f7244ecb6498ee385767a6edba03",
+      "bytes": 18380
+    }
+  },
+  "expected_rows": {
+    "database": 193734,
+    "test": 2100
+  },
+  "positive_counts": {
+    "sky": 74190,
+    "clouds": 54087,
+    "person": 51577,
+    "water": 35264,
+    "animal": 33887,
+    "grass": 22561,
+    "buildings": 17835,
+    "window": 15051,
+    "plants": 14345,
+    "lake": 13392,
+    "ocean": 11307,
+    "road": 9524,
+    "flowers": 8605,
+    "sunset": 8418,
+    "reflection": 7875,
+    "rocks": 6327,
+    "vehicle": 6099,
+    "snow": 5404,
+    "tree": 5352,
+    "beach": 5239,
+    "mountain": 5099
+  },
+  "verification": {
+    "official_zip_sha256": "73ee7c9e3996c31135cc5f0b67b0cca0801220cf7aa402585d96bb6608161b87",
+    "official_source": "https://huggingface.co/datasets/Lxyhaha/NUS-WIDE/blob/main/NUS-WIDE.zip",
+    "official_source_entrypoint": "https://github.com/NExTplusplus/NUS-WIDE",
+    "official_label_sha256": {
+      "sky": "0e2c21af8504e4c3190098d91b1fe24e41c21382be1edbcad398f761b4b455ae",
+      "clouds": "7567e4299f922af1d73fea26a1d194cd7785feeead444d6c5c18ceed306f9558",
+      "person": "d623886037738c0a6410076835d915263cb120daff3f710b320bb9848d7c1fed",
+      "water": "ab3e5dee9c0a1695289ef55e7f5f6d4e2607f8bb581c58ad74101c1e263b2615",
+      "animal": "84eb6daff3f205d9147f38323d9779f854a8eda1158c55abce542592924564b6",
+      "grass": "1f52017c1d731431f22832b9f7bd744f82bdc0957f3301a2a0cc29f4628245f8",
+      "buildings": "97e7728b149d377ed060a15d09fd8f179f5bd74cea4013c0cf8d18b9af974fca",
+      "window": "bd438cca9522acbd65c25f8b64b7ab740ad4a1fe9aa6e0cbe203309661f90683",
+      "plants": "cb8974822e15f132a27ef65091361eadbd68a906b4dff73dde15477146acb5e3",
+      "lake": "73d6e269c28746b883d7ddd6f12c91baff3b9726a51896c18439da7321a9aba4",
+      "ocean": "74c0c6a80cc760c3b26d9e32579c197148db37e4742c0dfd6d31dd73811e22fc",
+      "road": "2d373be1e2900d8463ff566c56207311931f604d9b8b4695c61f18dcd4be9a3f",
+      "flowers": "8018f03fc9849ef1dc3401b66588fb537c59915ad24d7da11315ba916486cfc9",
+      "sunset": "376d707916c6cabf5d946549c9f8c82ca2ee216e09baac56f3099aae8a0eae30",
+      "reflection": "df357fd813bc1beac3ecbefe2f3ac351d1a1c910447213851736edc5ae894e34",
+      "rocks": "ed71f7264d9169cdeaeb004a81e8e5651f98805a4fe4395c9ebd7fcfdc0ac62f",
+      "vehicle": "2eb8ee062b3236b4b84eda0f140fea82e4cc5b040f31426f3c402da193b4dafa",
+      "snow": "7fcfd23c8bcbe3d62d0a7c85ca543e7b5dde06bb427a912300741726c68cf748",
+      "tree": "00d756f6583ec910ec6b41dd7179b60bbe372d4131d94c3d4438fb35fd4aa601",
+      "beach": "e0ec638ef4d71bd36b2717cc0912c876c372121b78c5501ab58f5147825b779b",
+      "mountain": "50badcabff6a102136943739eabc3a596570080bd8421bffcf8bd0e4092803a9"
+    },
+    "method": "unique official positive counts identify columns, then compare complete nonempty joint-label histograms; integer and multi-hot rows checked exactly",
+    "joint_label_patterns": 4580,
+    "joint_label_histogram_sha256": "e3a1b2e0d8d69cce773a36552eba9bc40ec6791d34341b015d4651a69b572b5e",
+    "joint_label_histogram_equal": true,
+    "nonempty_official_rows": 195834,
+    "image_paths_unique_and_query_database_disjoint": true,
+    "limitations": "Statistical recovery of column semantics for these exact pinned files; no independent per-image comparison to official ImageList, which was not supplied. Image/label pairing follows explicit retrieval lists. This is not the official Train/Test split."
+  },
+  "nas8_policy": {
+    "snow_positive": "rain_snow=1",
+    "snow_negative": "rain_snow=-1",
+    "all_other_nas8_labels": -1,
+    "missing_target_concepts": [
+      "nighttime",
+      "sports"
+    ]
+  }
+}
