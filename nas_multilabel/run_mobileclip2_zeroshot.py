@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import open_clip
-from mobileclip.modules.common.mobileone import reparameterize_model
+from timm.utils import reparameterize_model
 
 from labels import DISPLAY_NAMES, LABELS, PROMPTS
 
