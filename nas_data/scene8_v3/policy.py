@@ -48,8 +48,11 @@ def map_mir(idx,sets):
     y=unknown(); ev={}
     for k in ('night','indoor'):
         potential=sets[k]; relevant=sets.get(k+'_r1')
-        if idx not in potential: assign(y,ev,k,0,'manual:outside_potential_'+k)
-        elif relevant is None or idx in relevant: assign(y,ev,k,1,'manual:positive_'+k)
+        # Explicit relevant positives win even if the released potential list
+        # omitted this ID. Never manufacture a negative from that inconsistency.
+        if relevant is not None and idx in relevant: assign(y,ev,k,1,'manual:relevant_positive_'+k)
+        elif idx not in potential: assign(y,ev,k,0,'manual:outside_potential_and_relevant_'+k)
+        elif relevant is None: assign(y,ev,k,1,'manual:positive_'+k)
         else: ev[k]='manual:potential_only_not_relevant;unknown'
     return y,ev
 

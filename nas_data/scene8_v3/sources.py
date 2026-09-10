@@ -34,9 +34,18 @@ def mir_rows(image_root,ann_root,seed,audit,excluded,expected=25000):
             if v not in images or v in ids:raise Blocked('MIR ID invalid or duplicate: '+str(p))
             ids.add(v)
         sets[p.stem.lower()]=ids;meta[p.name]={'path':str(p),'sha256':sha(p),'positives':len(ids)}
+    differences={}
     for k,v in sets.items():
-        if k.endswith('_r1') and not v<=sets.get(k[:-3],set()):raise Blocked('MIR relevance not subset: '+k)
-    audit['MIRFLICKR']={'annotation_files':meta,'readme_files':[str(p) for p in readmes],'negative_policy':'outside native potential list, not absence of user tags','image_count':len(images)}
+        if not k.endswith('_r1'):continue
+        if k[:-3] not in sets:raise Blocked('MIR relevant list without potential list: '+k)
+        extra=sorted(v-sets[k[:-3]])
+        if extra:
+            differences[k]={'count':len(extra),'ids':extra,'used_for_nas8':k[:-3] in ('night','indoor')}
+            print('MIR WARNING: relevant IDs outside potential:',k,len(extra),'(audited; original lists retained)',flush=True)
+    audit['MIRFLICKR']={'annotation_files':meta,'readme_files':[str(p) for p in readmes],
+        'relevant_outside_potential':differences,
+        'negative_policy':'outside BOTH native potential and relevant lists; explicit relevant positive takes precedence',
+        'image_count':len(images)}
     rows=[]
     for i,p in sorted(images.items()):
         y,ev=map_mir(i,sets)
@@ -44,17 +53,34 @@ def mir_rows(image_root,ann_root,seed,audit,excluded,expected=25000):
             original_labels={k:int(i in s) for k,s in sets.items()},sample_id='mir:'+str(i)))
     return rows
 
-def nus_rows(root,seed,audit,excluded):
+def nus_rows(root,seed,audit,excluded,metadata_root=None):
     root=Path(root);index=ImageIndex(root)
-    concepts=unique_file(root,'Concepts81.txt')
+    # Manual labels/image lists may be supplied separately from the photo mirror.
+    # Scan metadata once, avoiding repeated 269k-image walks for each concept.
+    metadata_root=Path(metadata_root) if metadata_root is not None else root
+    files={}
+    for path in metadata_root.rglob('*'):
+        if path.is_file() and path.suffix.lower()=='.txt':files.setdefault(path.name.lower(),[]).append(path)
+    def lookup(name,optional=False):
+        candidates=files.get(name.lower(),[])
+        if not candidates:
+            if optional:return None
+            raise Blocked('NUS missing '+name+' under '+str(metadata_root))
+        if len(candidates)>1 and len({sha(x) for x in candidates})!=1:
+            raise Blocked('NUS conflicting metadata copies: '+name)
+        return sorted(candidates,key=lambda x:(len(x.parts),str(x)))[0]
+    concepts=lookup('Concepts81.txt',True)
+    if concepts is None:
+        retrieval=any(k in files for k in ('database_label.txt','test_label.txt','targets_tc10.txt'))
+        raise Blocked('NUS_RETRIEVAL_MAPPING_UNVERIFIED: numeric retrieval labels are not the official 81-concept GT. Return nus_diagnostics.zip for ChatGPT to verify README/class mapping; do not invent indices or negatives.' if retrieval else 'NUS official Concepts81.txt missing; return nus_diagnostics.zip')
     names=[s.strip() for s in concepts.read_text(encoding='utf-8-sig').splitlines() if s.strip()]
     if len(names)!=81 or len(set(names))!=81 or not {'nighttime','sports','snow'}<=set(names):raise Blocked('NUS Concepts81 invalid or wrong dataset')
-    tr=unique_file(root,'TrainImagelist.txt',True);te=unique_file(root,'TestImagelist.txt',True)
+    tr=lookup('TrainImagelist.txt',True);te=lookup('TestImagelist.txt',True)
     tasks=[]
     if tr is not None and te is not None:
         tasks=[(tr,'Train'),(te,'Test')]
     else:
-        allp=unique_file(root,'Imagelist.txt',True)
+        allp=lookup('Imagelist.txt',True)
         if allp is None:raise Blocked('NUS needs official TrainImagelist/TestImagelist or Imagelist plus Groundtruth. CSV tags or sorted JPG order are NOT accepted. See archive inventory.')
         tasks=[(allp,None)]
     rows=[];manifest_audit=[]
@@ -63,7 +89,7 @@ def nus_rows(root,seed,audit,excluded):
         # sports subclasses are diagnostic contradictions, not a negative-complete sports taxonomy.
         for k in ('nighttime','sports','snow','soccer','running','swimmers','surf'):
             fname='Labels_%s%s.txt'%(k,'_'+split if split else '')
-            label=unique_file(root,fname,k not in ('nighttime','sports','snow'))
+            label=lookup(fname,k not in ('nighttime','sports','snow'))
             if label is None:continue
             vals=binary_lines(label)
             if len(vals)!=len(paths):raise Blocked('NUS row count mismatch %s=%d vs %s=%d'%(imgfile,len(paths),label,len(vals)))

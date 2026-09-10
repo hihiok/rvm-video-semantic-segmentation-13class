@@ -113,7 +113,70 @@ class Formats(unittest.TestCase):
             audit={};rows=a.mir_rows(im,ann,42,audit,[],expected=8)
             self.assertEqual(len(rows),8);self.assertEqual(rows[-1]['labels']['night'],0);self.assertEqual(rows[-1]['labels']['sports'],-1)
             (ann/'night_r1.txt').write_text('8\n')
-            with self.assertRaises(s.Blocked):a.mir_rows(im,ann,42,{},[],expected=8)
+            audit={};rows=a.mir_rows(im,ann,42,audit,[],expected=8)
+            self.assertEqual(rows[-1]['labels']['night'],1)
+            self.assertEqual(audit['MIRFLICKR']['relevant_outside_potential']['night_r1']['ids'],[8])
+
+    def test_mir_unused_people_difference_is_audited(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);ann=root/'ann';ann.mkdir()
+            for i in range(1,9):make_image(root/'images'/('im%d.jpg'%i),i)
+            for name,text in {'README.txt':'fixture','night.txt':'1\n','indoor.txt':'2\n',
+                              'people.txt':'1\n2\n','people_r1.txt':'3\n4\n5\n6\n'}.items():
+                (ann/name).write_text(text)
+            audit={};rows=a.mir_rows(root/'images',ann,42,audit,[],expected=8)
+            self.assertEqual(len(rows),8)
+            extra=audit['MIRFLICKR']['relevant_outside_potential']['people_r1']
+            self.assertEqual(extra['count'],4);self.assertFalse(extra['used_for_nas8'])
+            self.assertEqual(rows[2]['labels']['night'],0)
+            (ann/'people_r1.txt').write_text('9\n')
+            with self.assertRaises(s.Blocked):a.mir_rows(root/'images',ann,42,{},[],expected=8)
+            (ann/'people_r1.txt').write_text('3\n3\n')
+            with self.assertRaises(s.Blocked):a.mir_rows(root/'images',ann,42,{},[],expected=8)
+
+    def test_nus_separate_metadata_exact_order(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);meta=root/'meta';meta.mkdir();photos=root/'photos'
+            make_image(photos/'scene/z.jpg',1);make_image(photos/'scene/a.jpg',2)
+            (meta/'Concepts81.txt').write_text('\n'.join(['nighttime','sports','snow']+['k%d'%i for i in range(78)]))
+            (meta/'TrainImagelist.txt').write_text('scene/z.jpg\n')
+            (meta/'TestImagelist.txt').write_text('scene/a.jpg\n')
+            for concept in ('nighttime','sports','snow'):
+                (meta/('Labels_'+concept+'_Train.txt')).write_text('1\n')
+                (meta/('Labels_'+concept+'_Test.txt')).write_text('0\n')
+            rows=a.nus_rows(photos,42,{},[],metadata_root=meta)
+            self.assertEqual(rows[0]['labels']['night'],1)
+            self.assertEqual(rows[1]['labels']['night'],0)
+            self.assertEqual(rows[1]['preferred_split'],'test')
+            self.assertEqual(rows[1]['labels']['rain_snow'],-1)
+
+    def test_nus_retrieval_indices_never_guessed(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);make_image(root/'x.jpg',1)
+            (root/'database_img.txt').write_text('x.jpg\n')
+            (root/'database_label.txt').write_text('0 2 20\n')
+            with self.assertRaisesRegex(s.Blocked,'NUS_RETRIEVAL_MAPPING_UNVERIFIED'):
+                a.nus_rows(root,42,{},[])
+
+    def test_diagnostic_bundle_preserves_rows_and_has_no_images(self):
+        from source_preflight import export_nus_diagnostics
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t)/'source';root.mkdir();out=Path(t)/'diagnostics'
+            (root/'README.md').write_text('Top classes 21')
+            (root/'database_img.txt').write_text('z.jpg\na.jpg\n')
+            (root/'database_label.txt').write_text('0 2\n\n20\n')
+            (root/'proxy.md').write_text('PRIVATE NOT INCLUDED')
+            make_image(root/'z.jpg',1)
+            before=s.sha(root/'database_label.txt')
+            report=export_nus_diagnostics(root,out)
+            self.assertEqual(s.sha(root/'database_label.txt'),before)
+            item=next(x for x in report['metadata'] if x['path']=='database_label.txt')
+            self.assertEqual((item['rows'],item['blank_rows']),(3,1))
+            with zipfile.ZipFile(out/'nus_diagnostics.zip') as z:
+                self.assertFalse(any(x.endswith('.jpg') or 'proxy' in x for x in z.namelist()))
+                self.assertEqual(z.read('metadata/database_label.txt'),b'0 2\n\n20\n')
+            with self.assertRaises(s.Blocked):export_nus_diagnostics(root,out)
+            with self.assertRaises(s.Blocked):export_nus_diagnostics(root,root/'bad')
 
 class Curation(unittest.TestCase):
     def test_legacy_seg_rules_removed_and_user_fix(self):

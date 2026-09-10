@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-if [[ "${CONDA_DEFAULT_ENV:-}" != "Ultraface" ]]; then
-  echo 'HUMAN_ACTION_REQUIRED: YES; activate the existing Ultraface environment' >&2
+if [[ "${CONDA_DEFAULT_ENV:-}" != "ultraface" && "${CONDA_DEFAULT_ENV:-}" != "Ultraface" ]]; then
+  echo 'HUMAN_ACTION_REQUIRED: YES; activate the existing ultraface environment' >&2
   exit 2
 fi
 export CUDA_VISIBLE_DEVICES=""

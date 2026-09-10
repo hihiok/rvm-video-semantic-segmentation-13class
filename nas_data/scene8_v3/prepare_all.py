@@ -54,6 +54,7 @@ def main():
     p.add_argument('--mir-annotations',type=Path,default=BASE/'dataset/mirflickr25k_annotations_v080.zip')
     p.add_argument('--nus-archive',type=Path,default=BASE/'dataset/archive.zip')
     p.add_argument('--nus-root',type=Path,help='Reuse already extracted NUS root instead of archive; read-only')
+    p.add_argument('--nus-metadata-root',type=Path,help='Separate official ImageList, Concepts81 and Groundtruth root; never retrieval index guesses')
     p.add_argument('--cache-root',type=Path,default=BASE/'dataset/NAS8_new_sources_raw_v3')
     p.add_argument('--output-root',type=Path,default=BASE/'dataset/NAS8_multilabel_clean_v3')
     p.add_argument('--overrides',type=Path,help='Human-reviewed CSV, generated template supported')
@@ -62,6 +63,8 @@ def main():
     p.add_argument('--source-roots',nargs=4,type=Path,default=[BASE/'segmentation/datasets/coco',BASE/'segmentation/datasets/places365',BASE/'segmentation/datasets/COCO_ADE_13cls_16x9_640x360',BASE/'dataset/10_scenes'])
     a=p.parse_args();out=a.output_root.resolve();cache=a.cache_root.resolve()
     protected=[a.old_root.resolve()]+[x.resolve() for x in a.source_roots]
+    if a.nus_root:protected.append(a.nus_root.resolve())
+    if a.nus_metadata_root:protected.append(a.nus_metadata_root.resolve())
     if any(out==v or v in out.parents or out in v.parents or cache==v or v in cache.parents or cache in v.parents for v in protected):raise Blocked('Output/cache overlaps a source or old manifest root')
     if out==cache or out in cache.parents or cache in out.parents:raise Blocked('Keep cache and derived output as sibling directories')
     if out.exists():raise Blocked('Output already exists, do not overwrite. Choose a new --output-root: '+str(out))
@@ -90,7 +93,9 @@ def main():
         print('STAGE: parse MIRFLICKR manual labels',flush=True)
         rows=mir_rows(mirimg,mirann,a.seed,audit,excluded)
         print('STAGE: align NUS manual labels with image lists',flush=True)
-        rows+=nus_rows(nus,a.seed,audit,excluded)
+        from source_preflight import export_nus_diagnostics
+        export_nus_diagnostics(nus,out/'nus_diagnostics')
+        rows+=nus_rows(nus,a.seed,audit,excluded,metadata_root=a.nus_metadata_root)
         print('STAGE: rebuild legacy labels (not copying old labels)',flush=True)
         rows+=legacy_rows(a.old_root,Path(__file__).with_name('places365_io.txt'),a.source_roots,audit,excluded)
         for s in sorted({r['source'] for r in rows}):print('SOURCE',s,sum(r['source']==s for r in rows),flush=True)
@@ -163,6 +168,7 @@ def main():
         dump(out/'summary.json',summary);dump(out/'PREPARED.json',{'seed':a.seed,'source_inputs':audit.get('old_manifest_files',{})})
         print(json.dumps(summary,ensure_ascii=False,indent=2),flush=True)
     except Exception as e:
+        dump(out/'source_audit.json',audit)
         dump(out/'BLOCKED.json',{'status':'BLOCKED','HUMAN_ACTION_REQUIRED':True,'error':str(e),'traceback':traceback.format_exc(),
             'action':'Return this report plus archive_inventory. Do not rewrite source files or invent NUS image/GT ordering. No network downloads or training permitted.'})
         raise

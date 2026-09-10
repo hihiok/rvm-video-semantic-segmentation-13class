@@ -1,5 +1,7 @@
 # NAS 八类新数据合并、旧 GT 修复、100 张 GT 可视化 — V3
 
+Rev2 更新：已遇到 people_r1 / NUS 检索格式阻塞的服务器，先执行仓库根目录 CODEAGENT_NAS8_SOURCE_PREFLIGHT_REV2.md；不要直接重复全量准备。
+
 本文件供新的 CodeAgent chat 执行，只做数据准备，不启动/停止训练，不改模型、阈值、watchdog。
 
 ## 1. 目标和范围
@@ -73,7 +75,7 @@ export MIR_IMAGES="/data/pub1/z00919662/dataset/mirflickr25k.zip"
 export MIR_ANN="/data/pub1/z00919662/dataset/mirflickr25k_annotations_v080.zip"
 export NUS_ZIP="/data/pub1/z00919662/dataset/archive.zip"
 export CACHE_ROOT="/data/pub1/z00919662/dataset/NAS8_new_sources_raw_v3"
-export NEW_LABEL_ROOT="/data/pub1/z00919662/dataset/NAS8_multilabel_clean_v3"
+export NEW_LABEL_ROOT="/data/pub1/z00919662/dataset/NAS8_multilabel_clean_v3_rev2"
 ```
 
 旧来源只读根目录：
@@ -108,8 +110,8 @@ NUS 的 `archive.zip` 文件名不能证明内部布局。脚本先保存目录�
 初始化服务器实际存在的 conda.sh，再：
 
 ```bash
-conda activate Ultraface
-test "$CONDA_DEFAULT_ENV" = Ultraface
+conda activate ultraface
+test "$CONDA_DEFAULT_ENV" = ultraface
 export PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 python -c 'import sys,PIL; print(sys.version);print("Pillow",PIL.__version__)'
@@ -118,7 +120,7 @@ python test_pipeline.py
 bash -n run_prepare.sh
 ```
 
-24 项离线测试必须通过，网络请求/torch/GPU 不参与测试。不要把测试合成图当成真实 GT100 结果。
+28 项离线测试必须通过，网络请求/torch/GPU 不参与测试。不要把测试合成图当成真实 GT100 结果。
 
 检查源 ZIP 和旧三份 JSONL 存在：
 

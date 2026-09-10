@@ -7,3 +7,7 @@ MIR source: official MIRFLICKR25K v080 manual concept ID lists and original arch
 User's product definitions and reported example corrections are recorded in policy.py.
 All source-derived category mappings marked weak are NOT per-image manual labels.
 Code implementation is independent of the old FSD and of any model inference.
+
+Rev2: MIR released relevance lists may exceed potential lists; audit all differences and prioritize explicit relevant positives. No raw annotation is rewritten.
+Retrieved NUS numeric metadata is NOT yet semantically mapped. Public matching-layout example: https://github.com/RailLee/DualHash/blob/1a9b40866974bc0dc2d688ce1baa3b3f58a5647d/data/nus-wide/README.md describes top-21 and top-10 retrieval files, not all 81 labels. Matching the local archive is still pending.
+Official linked NUS metadata ZIP inspected by ChatGPT: https://huggingface.co/datasets/Lxyhaha/NUS-WIDE/blob/main/NUS-WIDE.zip has ConceptsList and Groundtruth, but no ImageList; labels alone cannot be joined to photos by sorting filenames.
