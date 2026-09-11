@@ -145,12 +145,16 @@ def legacy_rows(root,io_file,allowed_roots,audit,excluded):
     io,flat=places_map(io_file);rows=[];oldcounts=Counter();unmapped=Counter()
     audit['old_manifest_files']={}
     roots=[Path(p).resolve() for p in allowed_roots]
+    audit['legacy_root_counts']={str(p):0 for p in roots}
     for split in ('train','val','test'):
         file=Path(root)/(split+'.jsonl')
         audit['old_manifest_files'][split]={'path':str(file),'sha256':sha(file)}
         for old in read_jsonl(file):
             p=Path(old['image']).resolve()
-            if not any(p==a or a in p.parents for a in roots):raise Blocked('Legacy image outside allowed source roots: '+str(p))
+            matches=[a for a in roots if p==a or a in p.parents]
+            if not matches:raise Blocked('Legacy image outside allowed source roots: '+str(p))
+            dataset_root=max(matches,key=lambda a:len(a.parts))
+            audit['legacy_root_counts'][str(dataset_root)]+=1
             src={'coco2017':'coco','coco':'coco','seg13':'seg13','places365':'places365','10_scenes':'10_scenes'}.get(old.get('source'))
             if src is None:raise Blocked('Unknown legacy source: '+str(old.get('source')))
             oldcounts[src]+=1;y=unknown();ev={};detail=str(old.get('detail',''));reason=None
@@ -170,7 +174,7 @@ def legacy_rows(root,io_file,allowed_roots,audit,excluded):
                 assign(y,ev,k,v,'user_review:reported_specific_image_content')
             if reason:
                 excluded.append({'source':src,'image':str(p),'reason':reason,'detail':detail})
-            row=new_record(p,src,split,detail,y,ev,legacy_labels=old.get('labels',{}),sample_id=src+':'+str(p))
+            row=new_record(p,src,split,detail,y,ev,legacy_labels=old.get('labels',{}),sample_id=src+':'+str(p),source_dataset_root=str(dataset_root))
             if reason:row['force_review']=True
             rows.append(row)
     audit['legacy_source_counts']=dict(oldcounts);audit['ten_scenes_unmapped_or_ambiguous']=dict(unmapped)

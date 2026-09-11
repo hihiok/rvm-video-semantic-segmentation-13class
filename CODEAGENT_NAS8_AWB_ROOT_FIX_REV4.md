@@ -1,10 +1,19 @@
-> 已由 `CODEAGENT_NAS8_AWB_ROOT_FIX_REV4.md` 替代；继续执行请使用 Rev4，补齐 AWB_10_scenes 源根。
+# NAS 八类：AWB 根目录修复、完整清洗和 GT100 — Rev4 执行指令
 
-# NAS 八类：NUS21 解析、旧标签清洗、GT100 — Rev3 完整继续指令
-
-本文件替代 Rev2 的“诊断完成后等待映射”流程。用户已将 nus_diagnostics.zip
-上传给 ChatGPT；本版已针对该包完成列语义恢复和真实元数据全量解析。
+本文件替代 Rev3 继续执行指令。上轮在 legacy 清洗阶段因默认源根目录遗漏
+AWB_10_scenes 而 BLOCKED；这是代码默认配置缺漏，不是数据损坏。
+MIR 和已核验 NUS21 解析保留，上轮输出及诊断保留，复用已完整解压的 cache。
 当前目标是八类数据准备及可视化，不是历史九标签训练任务。
+
+本次修复：
+- 默认包含五个独立图片根目录，其中 10_scenes 和 AWB_10_scenes 分开列出。
+- --source-roots 接受一个或多个显式根目录，不再固定四个槽位。
+- 路径 resolve 后仍检查每张旧清单图片，输出/cache 重叠保护保留。
+- 不允许把公共祖先 /data/pub1/z00919662/dataset 当作替代源根。
+- 两个目录在旧 manifest 中的 source 均为 10_scenes，保持现有标签规则。
+  AWB_10_scenes/Night 为 night 弱正，不补雨雪、室内、户外标签。
+- source_audit.json 新增 legacy_root_counts，逐条 source_records 新增
+  source_dataset_root，便于分别核对两个物理目录。
 
 ## 1. 已确认的结论和范围
 
@@ -73,6 +82,8 @@ git -C "$PROJECT_ROOT" merge --ff-only "origin/$BRANCH"
 test "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" = "$(git -C "$PROJECT_ROOT" rev-parse "origin/$BRANCH")"
 test -s "$PROJECT_ROOT/nas_data/scene8_v3/nus21_verified_profile.json"
 test -s "$PROJECT_ROOT/nas_data/scene8_v3/nus21.py"
+test -s "$PROJECT_ROOT/nas_data/scene8_v3/test_legacy_roots.py"
+test -s "$PROJECT_ROOT/CODEAGENT_NAS8_AWB_ROOT_FIX_REV4.md"
 git -C "$PROJECT_ROOT" rev-parse HEAD
 ```
 
@@ -94,12 +105,13 @@ export CUDA_VISIBLE_DEVICES=""
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 cd "$PROJECT_ROOT/nas_data/scene8_v3"
 python -c 'import sys,PIL; print(sys.version); print(PIL.__version__)'
-python -m unittest test_pipeline test_nus21
+python -m unittest discover -s . -p 'test*.py'
 bash -n run_prepare.sh
 ```
 
-必须38项测试通过，包括MIR修复、NUS指纹/行配对/缺图不移位/雪负例unknown、
-复用cache/nus的路径保护和GT100布局。测试图不是用户真实GT100。
+必须42项测试通过，包括新增的五根默认配置、五来源旧清单解析、Night与合成图
+标签及物理来源追踪、相邻目录/符号链接越界拒绝、CLI五根与输出重叠保护。
+原有MIR、NUS指纹/行配对/雪负例unknown、GT100测试仍须通过。测试图不是用户真实GT100。
 
 输入路径（全部只读）：
 
@@ -119,6 +131,7 @@ MIR标注ZIP：
 /data/pub1/z00919662/segmentation/datasets/places365
 /data/pub1/z00919662/segmentation/datasets/COCO_ADE_13cls_16x9_640x360
 /data/pub1/z00919662/dataset/10_scenes
+/data/pub1/z00919662/dataset/AWB_10_scenes
 ```
 
 旧JSONL只作为图片清单；不沿用不可信的旧labels。原图、mask、ZIP、旧标签、
@@ -133,14 +146,14 @@ MIR仍复核ZIP和完成标记；NUS通过 --nus-root 复用，避免重复读�
 ```bash
 OLD_LABEL_ROOT=/data/pub1/z00919662/dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_v1
 CACHE_ROOT=/data/pub1/z00919662/dataset/NAS8_new_sources_raw_v3
-NEW_LABEL_ROOT=/data/pub1/z00919662/dataset/NAS8_multilabel_clean_v3_rev3
+NEW_LABEL_ROOT=/data/pub1/z00919662/dataset/NAS8_multilabel_clean_v3_rev4
 if [[ -e "$NEW_LABEL_ROOT" ]]; then
   NEW_LABEL_ROOT="${NEW_LABEL_ROOT}_$(date +%Y%m%d_%H%M%S)"
 fi
 for split in train val test; do test -s "$OLD_LABEL_ROOT/$split.jsonl"; done
 test -d "$CACHE_ROOT/nus"
 df -h /data/pub1/z00919662/dataset
-LOG="/data/pub1/z00919662/dataset/nas8_clean_rev3_$(date +%Y%m%d_%H%M%S).log"
+LOG="/data/pub1/z00919662/dataset/nas8_clean_rev4_$(date +%Y%m%d_%H%M%S).log"
 bash run_prepare.sh \
   --old-root "$OLD_LABEL_ROOT" \
   --mir-images /data/pub1/z00919662/dataset/mirflickr25k.zip \
@@ -148,6 +161,12 @@ bash run_prepare.sh \
   --nus-root "$CACHE_ROOT/nus" \
   --cache-root "$CACHE_ROOT" \
   --output-root "$NEW_LABEL_ROOT" \
+  --source-roots \
+    /data/pub1/z00919662/segmentation/datasets/coco \
+    /data/pub1/z00919662/segmentation/datasets/places365 \
+    /data/pub1/z00919662/segmentation/datasets/COCO_ADE_13cls_16x9_640x360 \
+    /data/pub1/z00919662/dataset/10_scenes \
+    /data/pub1/z00919662/dataset/AWB_10_scenes \
   --seed 20260910 2>&1 | tee "$LOG"
 ```
 
@@ -161,7 +180,7 @@ night/indoor显式relevant正例优先，potential-only unknown，原始标注�
 ## 5. 清洗与划分规则
 
 - 夜景：MIR人工night负责真实照片正负；旧COCO/SEG/Places的无依据夜景标签撤销。
-  NUS21夜景全部unknown，10_scenes夜景文件夹只提供明确标记的弱正。
+  NUS21夜景全部unknown，AWB_10_scenes/Night只提供明确标记的弱正。
 - 雨雪：雨或雪任一确认存在为正；只有两者都确认不存在为负。NUS只提供雪正。
   不用SEG13的ice_or_snow或“无雪”推出“无雨雪”，不整类从Places猜天气。
 - 风景：Places明确自然场景可提供弱标签；城市/主体不明确的区别处理。
@@ -191,6 +210,12 @@ night/indoor显式relevant正例优先，potential-only unknown，原始标注�
 - GT100：gt100/index.html、100张独立JPEG、gt100.csv、10张contact图；
 - review100_template.csv、weather_review_template.csv、resolution_audit.json。
 
+核对 source_audit.json 的 legacy_root_counts（清洗前清单行数，非最终训练数）：
+COCO 7000、Places365 219000、SEG13 115795、10_scenes 3077、AWB_10_scenes 31907。
+总数为376779。若与上轮不同，先核对 old_manifest_files 中的哈希及源清单变化，
+如实报告，不通过删行、改源名或改标签凑数。
+两个10_scenes物理目录继续归入同一逻辑来源，不增加或改变GT100配额。
+
 GT100固定配额：COCO15、Places36520、SEG13 15、MIR20、NUS20、10_scenes10，
 共100个不重复底层组。每张显示八类完整1/0/?、路径、来源、证据和是否进manifest。
 显示GT，不跑模型预测。包含少量unknown/排除图时必须明确标识，不冒充训练样本。
@@ -207,7 +232,7 @@ training_quality_blockers：不阻止GT100生成，但必须如实报告，不�
 未经人工批准不要填reviewed=1，也不要启动训练。
 
 报告：STATUS、branch/commit、环境、NEW_LABEL_ROOT、完整日志路径、各来源清洗
-前后数量、各split每类正/负/unknown、真实照片night/rain_snow负例数、
+前后数量、五个物理根的 legacy_root_counts、各split每类正/负/unknown、真实照片night/rain_snow负例数、
 NUS_FORMAT、NUS列顺序、雪正例5227/177与实际可用差异、缺图数、
 排除原因、split泄漏检查、GT100来源配额和路径、分辨率建议及训练质量缺口。
 

@@ -12,6 +12,13 @@ from visualize import export_review,review_template
 
 BASE=Path('/data/pub1/z00919662')
 OLD=BASE/'dataset/UltraFaceSlim_8scene_multilabel_manifests_640x360_v1'
+DEFAULT_SOURCE_ROOTS=[
+    BASE/'segmentation/datasets/coco',
+    BASE/'segmentation/datasets/places365',
+    BASE/'segmentation/datasets/COCO_ADE_13cls_16x9_640x360',
+    BASE/'dataset/10_scenes',
+    BASE/'dataset/AWB_10_scenes',
+]
 
 
 def apply_reviews(rows,path,audit):
@@ -60,7 +67,8 @@ def main():
     p.add_argument('--overrides',type=Path,help='Human-reviewed CSV, generated template supported')
     p.add_argument('--seed',type=int,default=20260910)
     p.add_argument('--inspect-only',action='store_true',help='Inventory local archives and legacy manifests only; no extraction')
-    p.add_argument('--source-roots',nargs=4,type=Path,default=[BASE/'segmentation/datasets/coco',BASE/'segmentation/datasets/places365',BASE/'segmentation/datasets/COCO_ADE_13cls_16x9_640x360',BASE/'dataset/10_scenes'])
+    p.add_argument('--source-roots',nargs='+',type=Path,default=DEFAULT_SOURCE_ROOTS,
+                   help='Allowed legacy image roots; list each dataset separately, never a shared output/cache ancestor')
     a=p.parse_args();out=a.output_root.resolve();cache=a.cache_root.resolve()
     protected=[a.old_root.resolve()]+[x.resolve() for x in a.source_roots]
     # A reused NUS source may be cache/nus. The cache can contain that source,
