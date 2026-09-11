@@ -85,6 +85,40 @@ class ManifestTests(unittest.TestCase):
         (self.root/'summary.json').write_text('{}')
         with self.assertRaises(ValueError):audit(self.root,'test')
 
+    def test_rev3_preflight_cli(self):
+        meta=dict(schema='nas8_source_curation_v3_rev3',labels=LABELS,
+                  status='PREPARED_REVIEW_REQUIRED',HUMAN_ACTION_REQUIRED=True,
+                  training_quality_blockers=['rain_snow_real_negative_shortage'])
+        (self.root/'summary.json').write_text(json.dumps(meta))
+        r=copy.deepcopy(self.rows['test'])
+        r['labels']=dict.fromkeys(LABELS,-1);r['labels']['rain_snow']=1
+        r['evidence']={'rain_snow':'manual:NUS21_verified_snow_positive'}
+        self.write('test',[r]);self.write('test_strict',[r])
+        rows,strict,info=audit(self.root,'test')
+        self.assertEqual(info['schema'],meta['schema'])
+        self.assertTrue(info['dataset_human_action_required'])
+        self.assertEqual(info['training_quality_blockers'],meta['training_quality_blockers'])
+        result=protocol(rows,strict,np.ones((1,8)))['strict']
+        self.assertEqual(result['per_class'][2]['status'],'SINGLE_CLASS_GT')
+        self.assertIsNone(result['summary']['macro_f1_all8'])
+        self.test_preflight_cli_without_torch()
+
+    def test_rev3_keeps_safety_checks(self):
+        meta=dict(schema='nas8_source_curation_v3_rev3',labels=LABELS)
+        (self.root/'summary.json').write_text(json.dumps(meta))
+        (self.root/'BLOCKED.json').write_text('{}')
+        with self.assertRaises(ValueError):audit(self.root,'test')
+        (self.root/'BLOCKED.json').unlink()
+        meta['labels']=list(reversed(LABELS))
+        (self.root/'summary.json').write_text(json.dumps(meta))
+        with self.assertRaises(ValueError):audit(self.root,'test')
+
+    def test_unverified_schema_rejected(self):
+        for schema in ('nas8_source_curation_v3_rev4','nas8_source_curation_v3_custom'):
+            with self.subTest(schema=schema):
+                (self.root/'summary.json').write_text(json.dumps(dict(schema=schema,labels=LABELS)))
+                with self.assertRaises(ValueError):audit(self.root,'test')
+
     def test_overlap_rejected(self):
         r=copy.deepcopy(self.rows['test']);r['group_id']='train';self.write('test',[r])
         with self.assertRaises(ValueError):audit(self.root,'test')
