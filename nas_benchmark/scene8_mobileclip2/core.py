@@ -8,6 +8,8 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 LABELS = ['night', 'indoor', 'rain_snow', 'office', 'outdoor', 'landscape', 'sports', 'objective_image']
 NAMES = ['夜景', '室内', '雨/雪', '办公场景', '户外', '自然风景', '运动', '客观图']
+# Rev3 preserves the manifest/strict contract and versions its NUS21 provenance.
+SUPPORTED_SCHEMAS = ('nas8_source_curation_v3', 'nas8_source_curation_v3_rev3')
 # Fixed before test inference; no tuning on val/test, no 8-way softmax.
 PROMPTS = {
     'night': (['a real photograph of a scene at nighttime', 'a night scene photographed after sunset'],
@@ -62,7 +64,7 @@ def read_manifest(path, split):
 def audit(root, split):
     root = Path(root)
     meta = json.loads((root/'summary.json').read_text())
-    if meta.get('schema') != 'nas8_source_curation_v3' or meta.get('labels') != LABELS:
+    if meta.get('schema') not in SUPPORTED_SCHEMAS or meta.get('labels') != LABELS:
         raise ValueError('Not a NAS8 clean V3 dataset; do not use old eight/nine-label manifests')
     if (root/'BLOCKED.json').exists() or not (root/'PREPARED.json').is_file():
         raise ValueError('Dataset preparation incomplete or blocked')
