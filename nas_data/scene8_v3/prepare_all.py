@@ -55,7 +55,11 @@ def write_manifest(p,rows):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__)
+    p=argparse.ArgumentParser(description=__doc__,allow_abbrev=False)
+    p.add_argument('--relocated-datasets-root',type=Path,help='New server datasets parent; relocate known legacy prefixes without editing input JSONL')
+    p.add_argument('--legacy-path-map',nargs=2,action='append',default=[],metavar=('OLD_ROOT','NEW_ROOT'),help='Explicit additional root relocation (repeatable)')
+    p.add_argument('--mir-image-root',type=Path,help='Read-only extracted MIR images; ZIP not required in this mode')
+    p.add_argument('--mir-annotation-root',type=Path,help='Read-only extracted MIR v080 annotations including README')
     p.add_argument('--old-root',type=Path,default=OLD)
     p.add_argument('--mir-images',type=Path,default=BASE/'dataset/mirflickr25k.zip')
     p.add_argument('--mir-annotations',type=Path,default=BASE/'dataset/mirflickr25k_annotations_v080.zip')
@@ -69,26 +73,46 @@ def main():
     p.add_argument('--inspect-only',action='store_true',help='Inventory local archives and legacy manifests only; no extraction')
     p.add_argument('--source-roots',nargs='+',type=Path,default=DEFAULT_SOURCE_ROOTS,
                    help='Allowed legacy image roots; list each dataset separately, never a shared output/cache ancestor')
-    a=p.parse_args();out=a.output_root.resolve();cache=a.cache_root.resolve()
+    a=p.parse_args()
+    from relocation import DATASET_NAMES,migration_maps,normalized_maps
+    path_maps=[]
+    if a.relocated_datasets_root:
+        root=a.relocated_datasets_root.resolve()
+        # Explicit command-line arguments always take precedence over migration defaults.
+        supplied={x.split('=',1)[0] for x in sys.argv[1:] if x.startswith('--')}
+        defaults={'old_root':root/OLD.name,'cache_root':root/'NAS8_new_sources_raw_v3',
+                  'output_root':root/'NAS8_multilabel_clean_v3_rev5',
+                  'mir_images':root/'mirflickr25k.zip','mir_annotations':root/'mirflickr25k_annotations_v080.zip',
+                  'nus_archive':root/'archive.zip','source_roots':[root/n for n in DATASET_NAMES]}
+        for key,value in defaults.items():
+            if '--'+key.replace('_','-') not in supplied:setattr(a,key,value)
+        path_maps=migration_maps(root)
+    # Explicit pairs may replace a known historical prefix for nonstandard layouts.
+    overrides=normalized_maps(a.legacy_path_map)
+    replaced={old for old,new in overrides}
+    path_maps=[(old,new) for old,new in path_maps if old not in replaced]+overrides
+    path_maps=normalized_maps(path_maps)
+    if bool(a.mir_image_root)!=bool(a.mir_annotation_root):raise Blocked('Supply BOTH extracted MIR image and annotation roots')
+    out=a.output_root.resolve();cache=a.cache_root.resolve()
     protected=[a.old_root.resolve()]+[x.resolve() for x in a.source_roots]
     # A reused NUS source may be cache/nus. The cache can contain that source,
     # but must not be created inside the read-only NUS source itself.
-    for extra in (a.nus_root,a.nus_metadata_root):
+    for extra in (a.nus_root,a.nus_metadata_root,a.mir_image_root,a.mir_annotation_root):
         if extra is None:continue
         v=extra.resolve()
         if out==v or v in out.parents or out in v.parents or cache==v or v in cache.parents:
-            raise Blocked('Output/cache overlaps a read-only NUS input')
+            raise Blocked('Output/cache overlaps a read-only extracted input')
     if any(out==v or v in out.parents or out in v.parents or cache==v or v in cache.parents or cache in v.parents for v in protected):raise Blocked('Output/cache overlaps a source or old manifest root')
     if out==cache or out in cache.parents or cache in out.parents:raise Blocked('Keep cache and derived output as sibling directories')
     if out.exists():raise Blocked('Output already exists, do not overwrite. Choose a new --output-root: '+str(out))
     out.mkdir(parents=True);inventory=out/'archive_inventory';inventory.mkdir();audit={};excluded=[]
     try:
         # Resolve the user's basename-only image ZIP without broad or ambiguous guessing.
-        if not a.mir_images.is_file():
+        if not a.mir_image_root and not a.mir_images.is_file():
             fallback=BASE/'segmentation/datasets/MIRFLICKR25K/downloads/mirflickr25k.zip'
-            if fallback.is_file():a.mir_images=fallback
+            if not a.relocated_datasets_root and fallback.is_file():a.mir_images=fallback
             else:raise Blocked('MIR image ZIP missing; supply actual --mir-images path (do not redownload automatically)')
-        for name,path in [('mir_images',a.mir_images),('mir_annotations',a.mir_annotations)]+([] if a.nus_root else [('nus',a.nus_archive)]):
+        for name,path in ([] if a.mir_image_root else [('mir_images',a.mir_images),('mir_annotations',a.mir_annotations)])+([] if a.nus_root else [('nus',a.nus_archive)]):
             if not path.is_file():raise Blocked('Missing local ZIP: '+str(path))
             with zipfile.ZipFile(path) as z:
                 members=safe_members(z)
@@ -99,18 +123,26 @@ def main():
                     'label_and_list_members':[i.filename for i in members if PurePosixPath(i.filename).suffix.lower() in ('.txt','.csv','.json','.zip')][:300]})
         if a.inspect_only:
             dump(out/'summary.json',{'status':'INSPECTED_ONLY','next':'run preparation with a NEW output root; no files extracted'});return
-        mirimg=extract(a.mir_images,cache/'mir_images',inventory,'a23d0a8564ee84cda5622a6c2f947785')
-        mirann=extract(a.mir_annotations,cache/'mir_annotations',inventory)
+        print('STAGE: validate legacy paths and rebuild labels',flush=True)
+        rows=legacy_rows(a.old_root,Path(__file__).with_name('places365_io.txt'),a.source_roots,audit,excluded,
+                         path_maps=path_maps,require_files=bool(path_maps or a.relocated_datasets_root))
+        dump(out/'source_audit.json',audit)
+        if a.mir_image_root:
+            for v in (a.mir_image_root,a.mir_annotation_root):
+                if not v.is_dir():raise Blocked('Missing extracted MIR root: '+str(v))
+            audit['MIR_input_mode']={'mode':'reused_extracted','images':str(a.mir_image_root.resolve()),
+                'annotations':str(a.mir_annotation_root.resolve()),'archive_checksum_rechecked':False,
+                'validation':'Complete im1..im25000 IDs, manual annotation IDs and hashes, selected image decoding'}
+        mirimg=a.mir_image_root.resolve() if a.mir_image_root else extract(a.mir_images,cache/'mir_images',inventory,'a23d0a8564ee84cda5622a6c2f947785')
+        mirann=a.mir_annotation_root.resolve() if a.mir_annotation_root else extract(a.mir_annotations,cache/'mir_annotations',inventory)
         nus=a.nus_root.resolve() if a.nus_root else extract(a.nus_archive,cache/'nus',inventory)
         if not a.nus_root:expand_nested(nus,inventory)
         print('STAGE: parse MIRFLICKR manual labels',flush=True)
-        rows=mir_rows(mirimg,mirann,a.seed,audit,excluded)
+        rows+=mir_rows(mirimg,mirann,a.seed,audit,excluded)
         print('STAGE: align NUS manual labels with image lists',flush=True)
         from source_preflight import export_nus_diagnostics
         export_nus_diagnostics(nus,out/'nus_diagnostics')
         rows+=nus_rows(nus,a.seed,audit,excluded,metadata_root=a.nus_metadata_root)
-        print('STAGE: rebuild legacy labels (not copying old labels)',flush=True)
-        rows+=legacy_rows(a.old_root,Path(__file__).with_name('places365_io.txt'),a.source_roots,audit,excluded)
         for s in sorted({r['source'] for r in rows}):print('SOURCE',s,sum(r['source']==s for r in rows),flush=True)
         apply_reviews(rows,a.overrides,audit)
         before=len(rows);rows=cap_candidates(rows,a.seed,excluded)
@@ -167,7 +199,7 @@ def main():
         dump(out/'source_audit.json',audit)
         for split,meta in audit['old_manifest_files'].items():
             if sha(meta['path'])!=meta['sha256']:raise Blocked('Old manifest changed externally during run: '+meta['path'])
-        summary={'status':'PREPARED_REVIEW_REQUIRED','schema':'nas8_source_curation_v3_rev3','labels':LABELS,
+        summary={'status':'PREPARED_REVIEW_REQUIRED','schema':'nas8_source_curation_v3_rev5','labels':LABELS,
             'nus_format':audit.get('NUS_WIDE',{}).get('format','native_official'),
             'nus_target_supervision':audit.get('NUS_WIDE',{}).get('target_supervision','native nighttime/sports/snow'),
             'source_observations':len(rows),'source_counts':dict(Counter(r['source'] for r in rows)),

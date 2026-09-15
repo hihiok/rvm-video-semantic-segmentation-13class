@@ -1,3 +1,5 @@
+> 新服务器迁移请使用 `CODEAGENT_NAS8_SERVER_MIGRATION_REV5.md`，不要在新服务器直接运行旧路径命令。
+
 # NAS 八类：AWB 根目录修复、完整清洗和 GT100 — Rev4 执行指令
 
 本文件替代 Rev3 继续执行指令。上轮在 legacy 清洗阶段因默认源根目录遗漏

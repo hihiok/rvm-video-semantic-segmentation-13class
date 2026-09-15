@@ -141,7 +141,11 @@ def identify_places(r,io,flat):
     if cat not in io:raise Blocked('Unknown Places category; do not guess: '+str(r))
     return cat
 
-def legacy_rows(root,io_file,allowed_roots,audit,excluded):
+def legacy_rows(root,io_file,allowed_roots,audit,excluded,path_maps=(),require_files=False):
+    from relocation import normalized_maps,relocate
+    mappings=normalized_maps(path_maps)
+    audit['path_relocation']={'mappings':[[str(a),str(b)] for a,b in mappings],'changed_rows':0,'missing_images':0,'missing_examples':[]}
+    relocation_audit=audit['path_relocation']
     io,flat=places_map(io_file);rows=[];oldcounts=Counter();unmapped=Counter()
     audit['old_manifest_files']={}
     roots=[Path(p).resolve() for p in allowed_roots]
@@ -150,16 +154,20 @@ def legacy_rows(root,io_file,allowed_roots,audit,excluded):
         file=Path(root)/(split+'.jsonl')
         audit['old_manifest_files'][split]={'path':str(file),'sha256':sha(file)}
         for old in read_jsonl(file):
-            p=Path(old['image']).resolve()
+            p=relocate(old['image'],mappings)
+            relocation_audit['changed_rows']+=str(p)!=old['image']
             matches=[a for a in roots if p==a or a in p.parents]
             if not matches:raise Blocked('Legacy image outside allowed source roots: '+str(p))
             dataset_root=max(matches,key=lambda a:len(a.parts))
             audit['legacy_root_counts'][str(dataset_root)]+=1
+            if require_files and not p.is_file():
+                relocation_audit['missing_images']+=1
+                if len(relocation_audit['missing_examples'])<20:relocation_audit['missing_examples'].append({'old':old['image'],'new':str(p)})
             src={'coco2017':'coco','coco':'coco','seg13':'seg13','places365':'places365','10_scenes':'10_scenes'}.get(old.get('source'))
             if src is None:raise Blocked('Unknown legacy source: '+str(old.get('source')))
             oldcounts[src]+=1;y=unknown();ev={};detail=str(old.get('detail',''));reason=None
             if src=='places365':
-                detail=identify_places(old,io,flat);y,ev=map_places(detail,io[detail])
+                detail=identify_places(dict(old,image=str(p)),io,flat);y,ev=map_places(detail,io[detail])
             elif src=='10_scenes':
                 detail=detail.split('->')[0] if '->' in detail else p.parent.name
                 y,ev,reason=map_ten(detail)
@@ -174,8 +182,10 @@ def legacy_rows(root,io_file,allowed_roots,audit,excluded):
                 assign(y,ev,k,v,'user_review:reported_specific_image_content')
             if reason:
                 excluded.append({'source':src,'image':str(p),'reason':reason,'detail':detail})
-            row=new_record(p,src,split,detail,y,ev,legacy_labels=old.get('labels',{}),sample_id=src+':'+str(p),source_dataset_root=str(dataset_root))
+            row=new_record(p,src,split,detail,y,ev,legacy_labels=old.get('labels',{}),sample_id=src+':'+old['image'],source_dataset_root=str(dataset_root),legacy_image_original=old['image'])
             if reason:row['force_review']=True
             rows.append(row)
+            if len(rows)%20000==0:print('LEGACY_PATHS',len(rows),'missing',relocation_audit['missing_images'],flush=True)
     audit['legacy_source_counts']=dict(oldcounts);audit['ten_scenes_unmapped_or_ambiguous']=dict(unmapped)
+    if relocation_audit['missing_images']:raise Blocked('MIGRATION_IMAGES_MISSING: %d; see source_audit.json path_relocation; finish copying these images before preparation'%relocation_audit['missing_images'])
     return rows
