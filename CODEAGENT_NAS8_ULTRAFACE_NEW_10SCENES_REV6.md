@@ -1,14 +1,17 @@
-> 用户已指定 ultraface_new 和以10_scenes替代AWB_10_scenes。请改用 `CODEAGENT_NAS8_ULTRAFACE_NEW_10SCENES_REV6.md`。
-
-# NAS 八类：新服务器迁移、标签清洗及 GT100 — Rev5 完整执行指令
+# NAS 八类：新服务器迁移、标签清洗及 GT100 — Rev6 完整执行指令
 
 本任务继续八类数据准备，不执行历史九标签训练文档。用户已停止旧服务器任务。
 数据已迁往 /mnt/ssd1/z00919662/datasets；其中 NAS8_multilabel_clean_v3_rev4
 是未完成的派生输出，保留原样，不当作已完成标签，也不作为旧原始清单输入。
-本文件替代 Rev4。不要重启旧训练、watchdog 或占 GPU。
+本文件替代 Rev5。不要重启旧训练、watchdog 或占 GPU。
 
-本次代码新增：
-- --relocated-datasets-root 设置新服务器路径，并按五个精确数据集前缀转换旧图片路径。
+本轮用户最新指定：使用已有 ultraface_new 环境；新服务器用10_scenes替代AWB_10_scenes。
+不要求创建、迁移或保留一个新的 AWB_10_scenes 目录。旧清单中的该前缀按下面
+显式参数映射到10_scenes，内部相对路径不变，例如 Night/a.jpg 对应10_scenes/Night/a.jpg。
+只接受实际存在的对应图片；缺图按实际路径报告，不能用另一张同名图片或改标签凑数。
+
+迁移代码能力：
+- --relocated-datasets-root 设置新服务器路径，并按历史数据集精确前缀转换旧图片路径。
 - 保留每条 legacy_image_original 和稳定 sample_id；新 image 使用新服务器真实路径。
 - 不按文件名搜索配图，不直接修改旧 JSONL，不建立伪造旧路径的软链接。
 - legacy 清单的路径校验与标签重建提前执行；迁移缺图汇总到 source_audit.json。
@@ -53,7 +56,7 @@ ocean, road, flowers, sunset, reflection, rocks, vehicle, snow, tree, beach, mou
 
 Repository: https://github.com/hihiok/rvm-video-semantic-segmentation-13class.git
 Branch: agent/nas8-mir-nus-clean-gt100-v3
-执行文件: CODEAGENT_NAS8_SERVER_MIGRATION_REV5.md
+执行文件: CODEAGENT_NAS8_ULTRAFACE_NEW_10SCENES_REV6.md
 代码默认目录: /mnt/ssd1/z00919662/NAS_scene_detection/nas8-mir-nus-clean-v3
 
 使用用户既有私有 proxy 配置。公开文档不保存密码，私有下载版提供完整设置。
@@ -85,7 +88,7 @@ git -C "$PROJECT_ROOT" checkout "$BRANCH"
 git -C "$PROJECT_ROOT" merge --ff-only "origin/$BRANCH"
 test "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" = "$(git -C "$PROJECT_ROOT" rev-parse "origin/$BRANCH")"
 test -s "$PROJECT_ROOT/nas_data/scene8_v3/relocation.py"
-test -s "$PROJECT_ROOT/CODEAGENT_NAS8_SERVER_MIGRATION_REV5.md"
+test -s "$PROJECT_ROOT/CODEAGENT_NAS8_ULTRAFACE_NEW_10SCENES_REV6.md"
 git -C "$PROJECT_ROOT" rev-parse HEAD
 ```
 
@@ -93,12 +96,13 @@ git -C "$PROJECT_ROOT" rev-parse HEAD
 若 checkout 有本地修改，先停止，返回 diff --stat；需把源码/补丁同步给 ChatGPT，
 不要覆盖、stash、reset --hard 或 git clean。记录本轮实际 commit，不中途滚动更新。
 
-只读查找本机现有 conda.sh，初始化后激活已有 ultraface 环境（Ultraface 大小写
-不同但确为同一用途的已迁移环境也可）。不新建环境、不升级依赖。
+只读查找本机现有 conda.sh，初始化后激活用户指定的已有 ultraface_new 环境。
+本轮不回退旧 ultraface 环境，不新建环境、不升级依赖。
 若本机未迁移环境，明确报告需要迁移/安装的环境，不能声称已有环境可用。
 
 ```bash
-conda activate ultraface
+conda activate ultraface_new
+test "$CONDA_DEFAULT_ENV" = ultraface_new
 export PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES=""
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 cd "$PROJECT_ROOT/nas_data/scene8_v3"
@@ -107,7 +111,7 @@ python -m unittest discover -s . -p 'test*.py'
 bash -n run_prepare.sh
 ```
 
-必须49项测试全部通过；包含迁移路径、越界/缺图阻断、只读旧清单、合成100图完整
+必须51项测试全部通过，新增环境入口和AWB替换路径集成测试；包含迁移路径、越界/缺图阻断、只读旧清单、合成100图完整
 流程测试。合成测试会替换原生MIR/NUS解析器；真实解析由原有独立测试和本机全量校验覆盖。
 
 ## 3. 核对新服务器文件（只读）
@@ -122,8 +126,7 @@ bash -n run_prepare.sh
 | COCO | coco/ |
 | Places365 | places365/（内部 versions/1/train、val 等层次保持原样） |
 | SEG13 | COCO_ADE_13cls_16x9_640x360/ |
-| 合成客观图等 | 10_scenes/ |
-| Night弱正 | AWB_10_scenes/ |
+| 合成客观图、Night弱正等 | 10_scenes/（按实际子目录映射） |
 | 已解压原始数据cache | NAS8_new_sources_raw_v3/mir_images、mir_annotations、nus |
 | 若未迁移解压数据，可用本地ZIP | mirflickr25k.zip、mirflickr25k_annotations_v080.zip、archive.zip |
 | 上轮未完成输出（保留） | NAS8_multilabel_clean_v3_rev4/ |
@@ -132,13 +135,14 @@ bash -n run_prepare.sh
 CodeAgent 可以只读查找文件并调整下面已有 CLI 参数的路径值，不得改源码或生成新解析器。
 不得把不完整 Rev4 的 train/val/test 或 source_records 冒充原始旧 manifest。
 
-默认自动转换两种历史前缀下的上述五个数据集：
+迁移代码识别以下两种历史前缀下的已知数据集：
 /data/pub1/z00919662/segmentation/datasets/<dataset>/...
 /data/pub1/z00919662/dataset/<dataset>/...
 到 /mnt/ssd1/z00919662/datasets/<dataset>/...，内部相对路径完整保留。
-已经指向新服务器的路径也接受。两个10_scenes目录不能合并。
+本轮通过显式 --legacy-path-map 将旧AWB_10_scenes及已迁移AWB前缀改指10_scenes。
+已经指向新服务器10_scenes的路径也接受，不移动或重命名图片。
 
-若实际目录名不同，可在命令同时显式传 --source-roots（列齐五个真实根）及
+若实际目录名不同，可在命令同时显式传 --source-roots（列齐本轮四个真实根）及
 --legacy-path-map OLD_DATASET_ROOT NEW_DATASET_ROOT（每个不同旧前缀重复一次）；
 只依据真实迁移对应关系，不按 basename 猜测，不传 datasets 公共祖先作为源根。
 --old-root、--cache-root、--mir-images、--mir-annotations、--nus-archive 等也可显式覆盖。
@@ -157,10 +161,10 @@ CodeAgent 可以只读查找文件并调整下面已有 CLI 参数的路径值�
 DATASETS_ROOT=/mnt/ssd1/z00919662/datasets
 OLD_LABEL_ROOT="$DATASETS_ROOT/UltraFaceSlim_8scene_multilabel_manifests_640x360_v1"
 CACHE_ROOT="$DATASETS_ROOT/NAS8_new_sources_raw_v3"
-NEW_LABEL_ROOT="$DATASETS_ROOT/NAS8_multilabel_clean_v3_rev5_$(date +%Y%m%d_%H%M%S)"
-LOG="$DATASETS_ROOT/nas8_clean_rev5_$(date +%Y%m%d_%H%M%S).log"
+NEW_LABEL_ROOT="$DATASETS_ROOT/NAS8_multilabel_clean_v3_rev6_$(date +%Y%m%d_%H%M%S)"
+LOG="$DATASETS_ROOT/nas8_clean_rev6_$(date +%Y%m%d_%H%M%S).log"
 for split in train val test; do test -s "$OLD_LABEL_ROOT/$split.jsonl"; done
-for src in coco places365 COCO_ADE_13cls_16x9_640x360 10_scenes AWB_10_scenes; do
+for src in coco places365 COCO_ADE_13cls_16x9_640x360 10_scenes; do
   test -d "$DATASETS_ROOT/$src"
 done
 MIR_ARGS=(--mir-images "$DATASETS_ROOT/mirflickr25k.zip" --mir-annotations "$DATASETS_ROOT/mirflickr25k_annotations_v080.zip")
@@ -178,6 +182,11 @@ bash run_prepare.sh \
   --cache-root "$CACHE_ROOT" \
   --output-root "$NEW_LABEL_ROOT" \
   "${MIR_ARGS[@]}" "${NUS_ARGS[@]}" \
+  --source-roots "$DATASETS_ROOT/coco" "$DATASETS_ROOT/places365" \
+    "$DATASETS_ROOT/COCO_ADE_13cls_16x9_640x360" "$DATASETS_ROOT/10_scenes" \
+  --legacy-path-map /data/pub1/z00919662/dataset/AWB_10_scenes "$DATASETS_ROOT/10_scenes" \
+  --legacy-path-map /data/pub1/z00919662/segmentation/datasets/AWB_10_scenes "$DATASETS_ROOT/10_scenes" \
+  --legacy-path-map "$DATASETS_ROOT/AWB_10_scenes" "$DATASETS_ROOT/10_scenes" \
   --seed 20260910 2>&1 | tee "$LOG"
 ```
 
@@ -193,7 +202,7 @@ summary.json 的 PREPARED_REVIEW_REQUIRED 且 GT100完整才算本轮准备完�
 ## 5. 清洗与划分规则
 
 - 夜景：MIR人工night负责真实照片正负；旧COCO/SEG/Places的无依据夜景标签撤销。
-  NUS21夜景全部unknown，AWB_10_scenes/Night只提供明确标记的弱正。
+  NUS21夜景全部unknown，10_scenes/Night只提供明确标记的弱正。
 - 雨雪：雨或雪任一确认存在为正；只有两者都确认不存在为负。NUS只提供雪正。
   不用SEG13的ice_or_snow或“无雪”推出“无雨雪”，不整类从Places猜天气。
 - 风景：Places明确自然场景可提供弱标签；城市/主体不明确的区别处理。
@@ -224,10 +233,11 @@ summary.json 的 PREPARED_REVIEW_REQUIRED 且 GT100完整才算本轮准备完�
 - review100_template.csv、weather_review_template.csv、resolution_audit.json。
 
 核对 source_audit.json 的 legacy_root_counts（清洗前清单行数，非最终训练数）：
-COCO 7000、Places365 219000、SEG13 115795、10_scenes 3077、AWB_10_scenes 31907。
-总数为376779，这是上轮旧清单的参考值，不是新训练数。若与上轮不同，先核对 old_manifest_files 中的哈希及源清单变化，
-如实报告，不通过删行、改源名或改标签凑数。
-两个10_scenes物理目录继续归入同一逻辑来源，不增加或改变GT100配额。
+上轮旧清单为COCO 7000、Places365 219000、SEG13 115795，另有10_scenes 3077和
+AWB_10_scenes 31907。本轮后两者路径都归入10_scenes，若清单未变则该物理根应计34984行；
+总数仍参考376779。迁移后多行指向同一图片时，由原有去重流程分组，不重复加入训练。
+数字不符先查看旧清单哈希和转换/缺图报告，不通过删行或改标签凑数。
+逐条记录保留legacy_image_original，可追溯原始两个目录的来源；GT100配额不变。
 
 GT100固定配额：COCO15、Places36520、SEG13 15、MIR20、NUS20、10_scenes10，
 共100个不重复底层组。每张显示八类完整1/0/?、路径、来源、证据和是否进manifest。
@@ -245,7 +255,7 @@ training_quality_blockers：不阻止GT100生成，但必须如实报告，不�
 未经人工批准不要填reviewed=1，也不要启动训练。
 
 报告：STATUS、branch/commit、环境、NEW_LABEL_ROOT、完整日志路径、各来源清洗
-前后数量、五个物理根的 legacy_root_counts、path_relocation 的转换/缺图数、各split每类正/负/unknown、真实照片night/rain_snow负例数、
+前后数量、四个物理根的 legacy_root_counts、path_relocation 的转换/缺图数、各split每类正/负/unknown、真实照片night/rain_snow负例数、
 NUS_FORMAT、NUS列顺序、雪正例5227/177与实际可用差异、缺图数、
 排除原因、split泄漏检查、GT100来源配额和路径、分辨率建议及训练质量缺口。
 
