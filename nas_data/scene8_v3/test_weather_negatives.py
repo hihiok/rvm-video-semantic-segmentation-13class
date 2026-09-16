@@ -1,17 +1,27 @@
 import unittest,tempfile,json,csv
 from pathlib import Path
 from test_refine_labels import row,make_image
-from weather_negatives import run,apply,select
+from weather_negatives import run,apply,select,apply_scene_rule
 from storage import dump,jsonl,sha,Blocked
 class WeatherTests(unittest.TestCase):
  def test_no_scene_implies_weather(self):
   rows=[row(str(i),{g:1}) for i,g in enumerate(('night','indoor','office','sports'))]
-  self.assertEqual(len(select(rows,10)),4)
+  self.assertEqual(len(select(rows,10)),3)
   self.assertTrue(all(r['labels']['rain_snow']==-1 for r in rows))
  def test_reject_unverified_and_positive(self):
   r=row('x',{'night':1,'rain_snow':1})
   with self.assertRaises(Blocked):apply([r],[{'split':'train','image':r['image'],'reviewed':'1'}])
   self.assertEqual(r['labels']['rain_snow'],1)
+ def test_user_rule_excludes_sports_overlap_and_preserves_positives(self):
+  rows=[row('night',{'night':1}),row('overlap',{'indoor':1,'sports':1}),row('office',{'office':1}),row('snow',{'night':1,'rain_snow':1}),row('snow2',{'rain_snow':1})]
+  changes=apply_scene_rule(rows)
+  self.assertEqual(len(changes),2)
+  self.assertEqual(rows[1]['labels']['rain_snow'],-1)
+  self.assertEqual(rows[3]['labels']['rain_snow'],1)
+  self.assertTrue(rows[0]['evidence']['rain_snow'].startswith('weak_user_rule:'))
+  from refine_labels import strict_rows
+  self.assertTrue(all(r['labels']['rain_snow']!=0 for r in strict_rows(rows)))
+  self.assertEqual(apply_scene_rule(rows),[])
  def test_two_pass_and_preservation(self):
   with tempfile.TemporaryDirectory() as t:
    base=Path(t);old=base/'old';old.mkdir();rows=[]

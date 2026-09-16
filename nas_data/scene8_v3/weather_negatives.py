@@ -8,11 +8,11 @@ from prepare_all import write_manifest
 from storage import dump,jsonl,sha,Blocked
 from curate import quality_gates
 
-GROUPS=('night','indoor','office','sports')
+GROUPS=('night','indoor','office')
 def select(rows,limit):
     chosen=[]
     for split in SPLITS:
-        pool=[r for r in rows if r['split']==split and r['labels']['rain_snow']==-1 and r['labels']['objective_image']!=1 and any(r['labels'][g]==1 for g in GROUPS)]
+        pool=[r for r in rows if r['split']==split and r['labels']['rain_snow']==-1 and r['labels']['objective_image']!=1 and r['labels']['sports']!=1 and any(r['labels'][g]==1 for g in GROUPS)]
         pool.sort(key=lambda r:hashlib.sha256(r['image'].encode()).hexdigest())
         seen=set(); buckets=[[r for r in pool if r['labels'][g]==1] for g in GROUPS]
         while len(seen)<limit and any(buckets):
@@ -34,12 +34,24 @@ def apply(rows,reviews):
         r=lookup[key]
         if v.get('rain_absent')!='1' or v.get('snow_absent')!='1' or not v.get('reviewer','').strip():raise Blocked('Reviewed negative requires rain_absent=1 AND snow_absent=1 and reviewer')
         if sha(Path(r['image']))!=v.get('image_sha256'):raise Blocked('Reviewed image hash mismatch')
-        if r['labels']['rain_snow']!=-1 or r['labels']['objective_image']==1 or not any(r['labels'][g]==1 for g in GROUPS):raise Blocked('Ineligible review; cannot overwrite weather positives or existing labels')
+        if r['labels']['rain_snow']!=-1 or r['labels']['objective_image']==1 or r['labels']['sports']==1 or not any(r['labels'][g]==1 for g in GROUPS):raise Blocked('Ineligible review; cannot overwrite weather positives or existing labels')
         r['labels']['rain_snow']=0;r['evidence']['rain_snow']='human_review:rain_absent_and_snow_absent'
         changes.append(dict(v))
     return changes
 
-def run(root,out,review=None,limit=200):
+def apply_scene_rule(rows):
+    changes=[]
+    # Keep the previously requested per-split negative <= positive cap.
+    for split in SPLITS:
+        rr=[r for r in rows if r['split']==split]
+        budget=max(0,sum(r['labels']['rain_snow']==1 for r in rr)-sum(r['labels']['rain_snow']==0 for r in rr))
+        for r in select(rr,budget):
+            r['labels']['rain_snow']=0
+            r['evidence']['rain_snow']='weak_user_rule:night_indoor_office_no_sports_weather_negative'
+            changes.append({'image':r['image'],'split':split,'before':-1,'after':0,'evidence':r['evidence']['rain_snow']})
+    return changes
+
+def run(root,out,review=None,limit=200,scene_rule=False):
     root=root.resolve();out=out.resolve()
     if out.exists() or out.parent!=root.parent:raise Blocked('Output must be a NEW sibling directory')
     rows,hashes,parent=load_completed(root)
@@ -48,12 +60,13 @@ def run(root,out,review=None,limit=200):
     try:
         removed=[]
         for r in rows:
-            if r['labels']['objective_image']==1 and r['labels']['rain_snow']==0:
-                removed.append({'image':r['image'],'split':r['split'],'before':0,'after':-1,'previous_evidence':r['evidence'].get('rain_snow')})
-                r['labels']['rain_snow']=-1;r['evidence']['rain_snow']='sampling:exclude_synthetic_weather_negative'
+            if (r['labels']['objective_image']==1 or r['labels']['sports']==1) and r['labels']['rain_snow']==0:
+                removed.append({'image':r['image'],'split':r['split'],'before':0,'after':-1,'previous_evidence':r['evidence'].get('rain_snow'),'objective_image':r['labels']['objective_image'],'sports':r['labels']['sports']})
+                r['labels']['rain_snow']=-1;r['evidence']['rain_snow']='sampling:exclude_synthetic_or_sports_weather_negative'
         changes=[]
         if review:
             with review.open(encoding='utf-8-sig',newline='') as f:changes=apply(rows,list(csv.DictReader(f)))
+        rule_changes=apply_scene_rule(rows) if scene_rule else []
         for r in rows:
             old=baseline[r['image']]
             for label in LABELS:
@@ -64,6 +77,7 @@ def run(root,out,review=None,limit=200):
             write_manifest(out/(split+'.jsonl'),selected)
             if split!='train':write_manifest(out/(split+'_strict.jsonl'),strict_rows(selected))
         candidates=select(rows,limit)
+        jsonl(out/'weather_weak_rule_changes.jsonl',rule_changes)
         fields=['split','image','image_sha256','candidate_classes','reviewed','rain_absent','snow_absent','reviewer','notes']
         with (out/'weather_review_template.csv').open('w',encoding='utf-8-sig',newline='') as f:
             w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
@@ -77,10 +91,12 @@ def run(root,out,review=None,limit=200):
             cards.append('<div><img loading="lazy" src="%04d.jpg"><p>%s</p><p>%s</p></div>'%(i,html.escape(r['split']),html.escape(r['image'])))
         (thumbs/'index.html').write_text('<meta charset="utf-8"><h1>Weather review: confirm BOTH no rain and no snow</h1>'+''.join(cards),encoding='utf-8')
         jsonl(out/'source_records.jsonl',rows);jsonl(out/'weather_removed_synthetic.jsonl',removed);jsonl(out/'weather_applied_reviews.jsonl',changes)
-        audit={'parent_root':str(root),'input_sha256':hashes,'synthetic_negative_labels_removed':len(removed),'real_negative_reviews_applied':len(changes),'candidate_counts':dict(Counter(r['split'] for r in candidates)),'all_records_and_positive_labels_preserved':True,'other_labels_unchanged':True,'review_file_sha256':sha(review) if review else None}
+        audit={'parent_root':str(root),'input_sha256':hashes,'synthetic_negative_labels_removed':sum(r['objective_image']==1 for r in removed),'sports_negative_labels_removed':sum(r['sports']==1 for r in removed),'real_negative_reviews_applied':len(changes),'candidate_counts':dict(Counter(r['split'] for r in candidates)),'all_records_and_positive_labels_preserved':True,'other_labels_unchanged':True,'review_file_sha256':sha(review) if review else None,'weak_rule_negatives_added':len(rule_changes),'weak_rule_is_not_individual_review':True,'sports_negative_count':sum(r['labels']['sports']==1 and r['labels']['rain_snow']==0 for r in rows)}
         dump(out/'weather_audit.json',audit)
         source=json.loads((root/'source_audit.json').read_text());source['weather_refinement']=audit;dump(out/'source_audit.json',source)
-        summary=dict(parent);summary.update(schema='nas8_weather_rev9',parent_root=str(root),splits=counts,new_split_group_overlap=overlap,training_quality_blockers=blocks,READY_FOR_TRAINING=False,HUMAN_ACTION_REQUIRED=True,training_started=False,gt_visualizations=0,human_action='Review weather_review/index.html and fill CSV; run again with --reviews into a new sibling. No training.')
+        summary=dict(parent);summary.update(schema='nas8_weather_rev10',parent_root=str(root),splits=counts,new_split_group_overlap=overlap,training_quality_blockers=blocks,READY_FOR_TRAINING=False,HUMAN_ACTION_REQUIRED=True,training_started=False,gt_visualizations=0,human_action='Review weather_review/index.html and fill CSV; run again with --reviews into a new sibling. No training.')
+        if scene_rule:summary['human_action']='User-authorized weak scene rule applied. No individual review claimed; no automatic training.'
+        summary['weather_weak_label_notice']='Scene-rule negatives are unverified; excluded from strict metrics. No claim of reviewed weather ground truth.'
         summary.pop('negative_cap_passed',None);summary.pop('max_negative_to_positive',None)
         summary['weather_refinement']=audit
         for name,h in hashes.items():
@@ -91,7 +107,7 @@ def run(root,out,review=None,limit=200):
         dump(out/'BLOCKED.json',{'error':str(e),'traceback':traceback.format_exc()});raise
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--input-root',type=Path,required=True);p.add_argument('--output-root',type=Path,required=True);p.add_argument('--reviews',type=Path);p.add_argument('--candidates-per-split',type=int,default=200)
+    p=argparse.ArgumentParser();p.add_argument('--input-root',type=Path,required=True);p.add_argument('--output-root',type=Path,required=True);p.add_argument('--reviews',type=Path);p.add_argument('--candidates-per-split',type=int,default=200);p.add_argument('--user-scene-negative-rule',action='store_true')
     a=p.parse_args()
     if a.candidates_per_split<1:p.error('candidate count must be positive')
-    run(a.input_root,a.output_root,a.reviews,a.candidates_per_split)
+    run(a.input_root,a.output_root,a.reviews,a.candidates_per_split,a.user_scene_negative_rule)
