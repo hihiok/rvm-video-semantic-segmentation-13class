@@ -24,9 +24,11 @@ ALIASES = {
  'objective_image': {'computer_synthesized','computer_synthetic','computer_generated','objective','objective_image','test_pattern','test_patterns','resolution_chart','resolution_charts','客观图'},
  'landscape_review': {'landscape','landscapes','scenery','scenic','landscape_scene','风景'},
 }
-REPORTED = ['Places365_val_00027091.jpg','ADE_train_00001854.jpg','000000465180.jpg','000000032334.jpg','000000469246.jpg']
-# These two corrections come ONLY from the user's explicit visual descriptions.
+REPORTED = ['Places365_val_00027091.jpg','ADE_train_00001854.jpg','000000465180.jpg','000000032334.jpg','000000469246.jpg','im14411.jpg','im1414.jpg']
+# These corrections come ONLY from the user's explicit visual descriptions.
 USER_FIXES = {
+ ('mirflickr','im14411.jpg'): {'indoor':0,'outdoor':1},
+ ('mirflickr','im1414.jpg'): {'indoor':0,'outdoor':1},
  ('seg13','ADE_train_00001854.jpg'): {'sports':1,'landscape':0},
  ('seg13','000000465180.jpg'): {'landscape':0},
  ('coco','000000465180.jpg'): {'landscape':0},
@@ -54,6 +56,9 @@ def map_mir(idx,sets):
         elif idx not in potential: assign(y,ev,k,0,'manual:outside_potential_and_relevant_'+k)
         elif relevant is None: assign(y,ev,k,1,'manual:positive_'+k)
         else: ev[k]='manual:potential_only_not_relevant;unknown'
+    for label,value in USER_FIXES.get(('mirflickr','im%d.jpg'%idx),{}).items():
+        prior='value=%s;evidence=%s'%(y[label],ev.get(label,'unknown'))
+        assign(y,ev,label,value,'user_review:reported_specific_image_outdoor;previous_'+prior)
     return y,ev
 
 def map_nus(gt):
