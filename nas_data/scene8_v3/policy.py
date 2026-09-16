@@ -93,6 +93,9 @@ def map_ten(folder):
         return y,ev,'old_landscape_definition_unknown_requires_review'
     if k=='day': assign(y,ev,'night',0,'weak:explicit_day_folder')
     else: assign(y,ev,k,1,'weak:10_scenes_folder_'+key)
+    # User confirmed this source's Night folder contains outdoor dashcam scenes.
+    # Dataset-level evidence, not per-image review and not a general night rule.
+    if k=='night': assign(y,ev,'outdoor',1,'user_dataset:10_scenes_Night_dashcam_outdoor')
     if k=='office': assign(y,ev,'indoor',1,'weak:office_scene_hierarchy')
     if k=='objective_image':
         # User-defined pattern/chart bucket; don't impose this rule on arbitrary CGI.

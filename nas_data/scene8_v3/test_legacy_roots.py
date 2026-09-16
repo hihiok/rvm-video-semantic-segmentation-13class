@@ -50,7 +50,9 @@ class LegacyRoots(unittest.TestCase):
             self.assertEqual(rows[4]['source_dataset_root'], str(roots[4]))
             self.assertEqual(rows[4]['labels']['night'], 1)
             self.assertTrue(rows[4]['evidence']['night'].startswith('weak:'))
-            for label in ('rain_snow', 'indoor', 'outdoor', 'sports'):
+            self.assertEqual(rows[4]['labels']['outdoor'], 1)
+            self.assertEqual(rows[4]['evidence']['outdoor'], 'user_dataset:10_scenes_Night_dashcam_outdoor')
+            for label in ('rain_snow', 'indoor', 'sports'):
                 self.assertEqual(rows[4]['labels'][label], -1)
             self.assertEqual(rows[3]['labels']['objective_image'], 1)
             self.assertEqual(rows[3]['labels']['night'], 0)
