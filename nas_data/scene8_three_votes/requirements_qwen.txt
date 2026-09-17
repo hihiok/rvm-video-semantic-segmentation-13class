@@ -1,0 +1,5 @@
+# Install ONLY in a new venv with --system-site-packages based on the proven MobileCLIP Python.
+# Reuses existing torch 2.4.1+cu118 / torchvision 0.19.1+cu118 without altering their environment.
+transformers==4.57.1
+accelerate==1.10.1
+huggingface_hub==0.34.4
