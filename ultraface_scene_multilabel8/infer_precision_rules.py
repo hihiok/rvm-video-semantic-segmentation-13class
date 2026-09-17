@@ -15,20 +15,22 @@ from decision_policy import tune_thresholds,decide,top1_099
 
 STAGES=('original_calibrated','all_099','top1_plus_099','precision_only','precision_context')
 
-def make_gallery(out,rows,gt,scores,thresholds,stages,notes,wh,n,seed):
- folder=out/'gallery';folder.mkdir();th=thresholds;final=stages[STAGES[-1]]
+def make_gallery(out,rows,gt,scores,thresholds,stages,notes,wh,n,seed,fixed_confidence=None):
+ folder=out/'gallery';folder.mkdir();th=thresholds;final=stages[list(stages)[-1]]
  cases,stats=select_cases(gt,scores,th,n,seed,decisions=final);selected=[]
  home=['<p>根据最终分类别阈值＋有限冲突处理，分类别抽取正确和错误。GT未知不计对错。每张卡片展示各策略在同一图片的输出。</p><p>各类先使用独立阈值；无类别达标才用最高分兜底，标记未达阈值。室内/户外只保留分数较高者，分数接近时标记歧义。室内与夜景、雨雪不互斥。弱GT不等于人工确认。</p>']
+ if fixed_confidence is not None:
+  home[0]=home[0].replace('各类先使用独立阈值','各类confidence固定为%.2f（未经validation选择）'%fixed_confidence)
  for j,label in enumerate(LABELS):
   home.append('<h2>'+NAMES[label]+'</h2><ul>')
   for group in ('correct','error'):
    groupdir=folder/label/group;groupdir.mkdir(parents=True);cards=[];paths=[]
    for number,i in enumerate(cases[label][group],1):
     r=rows[i];status=result(int(gt[i,j]),bool(final[i,j]));name='%02d_%s.jpg'%(number,status)
-    policy_note='VAL thresholds | * = context suppression | '+('FALLBACK TOP1: below threshold' if notes[i]['fallback_top1'] else 'Threshold-qualified output')
+    policy_note=('VAL thresholds' if fixed_confidence is None else 'Fixed confidence %.2f'%fixed_confidence)+' | * = context suppression | '+('FALLBACK TOP1: below threshold' if notes[i]['fallback_top1'] else 'Threshold-qualified output')
     render_card(groupdir/name,r,scores[i],th,label,status,wh,decisions=final[i],rule_notes=notes[i]['suppressed'],policy_note=policy_note);paths.append(groupdir/name)
     body='<table><tr><th>方案</th><th>预测正类别</th></tr>'
-    for stage in STAGES:body+='<tr><td>'+stage+'</td><td>'+html.escape(', '.join(k for k,p in zip(LABELS,stages[stage][i]) if p) or '(none)')+'</td></tr>'
+    for stage in stages:body+='<tr><td>'+stage+'</td><td>'+html.escape(', '.join(k for k,p in zip(LABELS,stages[stage][i]) if p) or '(none)')+'</td></tr>'
     body+='</table><p class="warn">规则压制：'+html.escape(json.dumps(notes[i],ensure_ascii=False))+'</p>'
     body+=detail_table(r,scores[i],th,decisions=final[i])
     cards.append('<div class="card"><a href="'+name+'"><img loading="lazy" src="'+name+'"></a>'+body+'<p>'+html.escape(r['image'])+'</p></div>')
