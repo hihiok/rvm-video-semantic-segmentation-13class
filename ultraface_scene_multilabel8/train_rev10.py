@@ -46,10 +46,11 @@ def average_precision(y,s):
  ends=np.r_[np.where(np.diff(ss)!=0)[0],len(ss)-1]
  recall=tp[ends]/sum(y==1);precision=tp[ends]/(ends+1)
  return float(np.sum(np.diff(np.r_[0,recall])*precision))
-def metrics(gt,sc,threshold):
+def metrics(gt,sc,threshold,decisions=None):
+ if decisions is not None and np.asarray(decisions).shape!=gt.shape:raise ValueError("Decision shape mismatch")
  result=[]
  for j,label in enumerate(LABELS):
-  m=gt[:,j]>=0;y=gt[m,j];s=sc[m,j];p=s>=threshold[j]
+  m=gt[:,j]>=0;y=gt[m,j];s=sc[m,j];p=s>=threshold[j] if decisions is None else np.asarray(decisions,dtype=bool)[m,j]
   pos=int(sum(y==1));neg=int(sum(y==0));tp=int(sum(p&(y==1)));fp=int(sum(p&(y==0)));fn=pos-tp;tn=neg-fp
   supported=pos>0 and neg>0
   result.append({'label':label,'threshold':float(threshold[j]),'positive':pos,'negative':neg,'unknown':int(sum(~m)),

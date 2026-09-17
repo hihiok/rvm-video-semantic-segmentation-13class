@@ -18,8 +18,9 @@ def tier(row,label):
  if ev.startswith(('human_review:','user_review:')):return 'HUMAN'
  if ev.startswith('manual:'):return 'MANUAL'
  return 'WEAK/RULE'
-def select_cases(gt,scores,thresholds,n,seed):
- predictions=scores>=thresholds
+def select_cases(gt,scores,thresholds,n,seed,decisions=None):
+ predictions=scores>=thresholds if decisions is None else np.asarray(decisions,dtype=bool)
+ if predictions.shape!=gt.shape:raise ValueError("Decision shape mismatch")
  chosen={};stats={}
  for j,label in enumerate(LABELS):
   status=[result(int(gt[i,j]),bool(predictions[i,j])) for i in range(len(gt))]
@@ -32,19 +33,20 @@ def select_cases(gt,scores,thresholds,n,seed):
    stats[label][group]={'available':len(pool),'selected':len(chosen[label][group]),'shortfall':max(0,n-len(pool)),'selected_outcomes':dict(Counter(status[i] for i in chosen[label][group]))}
  return chosen,stats
 
-def read_inputs(run,root):
- paths={'config':run/'config.json','complete':run/'COMPLETE.json','thresholds':run/'thresholds.json','predictions':run/'test_predictions.npz','manifest':root/'test.jsonl'}
+def read_inputs(run,root,split="test"):
+ if split not in ("val","test"):raise ValueError("Only val/test supported")
+ paths={'config':run/'config.json','complete':run/'COMPLETE.json','thresholds':run/'thresholds.json','predictions':run/(split+'_predictions.npz'),'manifest':root/(split+'.jsonl')}
  hashes={k:sha(v) for k,v in paths.items()}
  config=json.loads(paths['config'].read_text());complete=json.loads(paths['complete'].read_text())
  if complete.get('status')!='TRAINING_COMPLETE':raise ValueError('Training completion marker required')
  if config.get('labels')!=LABELS:raise ValueError('Prediction label order does not match NAS8')
- if config.get('data_sha256',{}).get('test.jsonl')!=hashes['manifest']:raise ValueError('Test manifest differs from training input')
+ if config.get('data_sha256',{}).get(split+'.jsonl')!=hashes['manifest']:raise ValueError('Test manifest differs from training input')
  th=json.loads(paths['thresholds'].read_text())
  if set(th)!=set(LABELS):raise ValueError('Invalid threshold labels')
  thresholds=np.array([th[k] for k in LABELS],dtype=float)
  if not np.all(np.isfinite(thresholds)) or np.any((thresholds<0)|(thresholds>1)):raise ValueError('Invalid thresholds')
  rows=load(paths['manifest']);mapping={r['image']:r for r in rows}
- if len(mapping)!=len(rows) or any(r.get('split')!='test' for r in rows):raise ValueError('Duplicate image or non-test row')
+ if len(mapping)!=len(rows) or any(r.get('split')!=split for r in rows):raise ValueError('Duplicate image or non-test row')
  with np.load(paths['predictions'],allow_pickle=False) as z:
   images=z['image'];gt=z['gt'].copy();scores=z['scores'].copy()
   if images.ndim!=1 or images.dtype.kind not in ('U','S'):raise ValueError('Image paths must be a string vector')
@@ -65,7 +67,8 @@ def font(size):
   if Path(p).is_file():return ImageFont.truetype(p,size)
  try:return ImageFont.load_default(size=size)
  except TypeError:return ImageFont.load_default()
-def render_card(path,row,score,threshold,focus,status,wh):
+def render_card(path,row,score,threshold,focus,status,wh,decisions=None,rule_notes=None,policy_note=None):
+ decisions=np.asarray(score)>=threshold if decisions is None else np.asarray(decisions,dtype=bool)
  canvas=Image.new('RGB',(1360,1060),'#f7f9fc');d=ImageDraw.Draw(canvas)
  f=font(21);small=font(16);heading=font(30)
  color='#bd3434' if status in ('FP','FN') else '#177552'
@@ -76,31 +79,32 @@ def render_card(path,row,score,threshold,focus,status,wh):
   # Context inset only: PIL bilinear preview, not a rerun of OpenCV inference.
   inp=im.resize(tuple(wh),Image.Resampling.BILINEAR);inp=inp.resize((384,216),Image.Resampling.BILINEAR);canvas.paste(inp,(948,110))
  d.text((948,339),'Input aspect preview '+str(wh[0])+'x'+str(wh[1]),font=small,fill='#25354a')
- positives=[k for k in LABELS if row['labels'][k]==1];predicted=[k for k,p,t in zip(LABELS,score,threshold) if p>=t]
+ positives=[k for k in LABELS if row['labels'][k]==1];predicted=[k for k,p in zip(LABELS,decisions) if p]
  text='GT+: '+(', '.join(positives) or '(none)')+'\n\nPRED+: '+(', '.join(predicted) or '(none)')
  yy=380
  for part in text.split('\n'):
   for line in textwrap.wrap(part,33) or ['']:
    d.text((948,yy),line,font=small,fill='#25354a');yy+=22
- d.text((24,603),'GT 1=yes  0=no  ?=unknown | WEAK/RULE is not individually verified GT',font=f,fill='#8b4c16')
+ d.text((24,603),policy_note or 'GT 1=yes  0=no  ?=unknown | WEAK/RULE is not individually verified GT',font=f,fill='#8b4c16')
  columns=[24,250,325,410,550,695,830]
  headers=['LABEL','GT','PRED','PROBABILITY','THRESHOLD','RESULT','EVIDENCE']
  for x,h in zip(columns,headers):d.text((x,640),h,font=small,fill='#445469')
  for j,k in enumerate(LABELS):
-  y=673+j*34;pred=bool(score[j]>=threshold[j]);outcome=result(row['labels'][k],pred)
+  y=673+j*34;pred=bool(decisions[j]);outcome=result(row['labels'][k],pred)
   bg='#fde7e7' if outcome in ('FP','FN') else ('#e8f4ed' if outcome!='UNKNOWN' else '#e9edf2')
   d.rectangle((20,y-2,1340,y+30),fill=bg)
-  values=[k,'?' if row['labels'][k]==-1 else str(row['labels'][k]),str(int(pred)),format(float(score[j]),'.6f'),format(float(threshold[j]),'.6f'),outcome,tier(row,k)]
+  values=[k+('*' if rule_notes and k in rule_notes else ''),'?' if row['labels'][k]==-1 else str(row['labels'][k]),str(int(pred)),format(float(score[j]),'.6f'),format(float(threshold[j]),'.6f'),outcome,tier(row,k)]
   for x,v in zip(columns,values):d.text((x,y),v,font=f,fill='#182737')
- d.text((24,958),'FP: predicted yes, GT no | FN: predicted no, GT yes | UNKNOWN: not scored',font=small,fill='#25354a')
+ d.text((24,958),('RULE SUPPRESSION (*): '+', '.join(rule_notes)) if rule_notes else 'FP: predicted yes, GT no | FN: predicted no, GT yes | UNKNOWN: not scored',font=small,fill='#25354a')
  lines=textwrap.wrap(row['image'],145)
  for n,line in enumerate(lines[:3]):d.text((24,984+n*21),line,font=small,fill='#445469')
  canvas.save(path,quality=92)
 
-def detail_table(row,scores,threshold):
+def detail_table(row,scores,threshold,decisions=None):
+ decisions=np.asarray(scores)>=threshold if decisions is None else np.asarray(decisions,dtype=bool)
  head='<table><tr><th>类别</th><th>GT</th><th>预测</th><th>概率</th><th>阈值</th><th>结果</th><th>依据</th></tr>'
  for j,k in enumerate(LABELS):
-  y=row['labels'][k];p=bool(scores[j]>=threshold[j]);ev=row.get('evidence',{}).get(k,'')
+  y=row['labels'][k];p=bool(decisions[j]);ev=row.get('evidence',{}).get(k,'')
   head+='<tr>'+''.join('<td>'+html.escape(str(v))+'</td>' for v in [NAMES[k], '?' if y==-1 else y,int(p),'%.6f'%scores[j],'%.6f'%threshold[j],result(y,p),tier(row,k)+' | '+ev])+'</tr>'
  return head+'</table>'
 def run(run_dir,data_root,out,per_group=10,seed=20260917):
