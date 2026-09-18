@@ -6,7 +6,21 @@ import html
 import os
 from pathlib import Path
 import shutil
-from common import LABELS, read, dump, digest, sha, load_run, RecordStore, fuse
+from common import LABELS, read, dump, digest, sha, load_run, RecordStore, fuse, approved_legacy_resume
+
+
+def compatible_completed_signature(completed, signature, plan, metadata, preview_only):
+    if completed['signature'] == signature:
+        return True
+    # Existing preview200 remains immutable. Only an exactly pinned legacy
+    # policy with identical plan and teacher metadata is eligible for reuse.
+    if not all(approved_legacy_resume(m.get('code_hashes')) for m in metadata):
+        return False
+    legacy = metadata[0]['code_hashes']
+    expected = digest({'plan': plan, 'teacher_metadata': metadata,
+                       'merge_code': legacy['merge.py'], 'common_code': legacy['common.py'],
+                       'preview_only': preview_only})
+    return completed['signature'] == expected
 
 
 def render(rows, folder):
@@ -73,7 +87,8 @@ def run(a):
     dest=root/('preview200' if a.preview_only else 'merged')
     if (dest/'COMPLETE.json').exists():
         completed=read(dest/'COMPLETE.json')
-        if completed['signature']!=signature: raise ValueError('Existing merge has a different policy')
+        if not compatible_completed_signature(completed,signature,plan,metadata,a.preview_only):
+            raise ValueError('Existing merge has a different policy')
         for n,h in completed['files'].items():
             if sha(dest/n)!=h: raise ValueError('Completed merge output modified')
         print('MERGE_REUSED',str(dest),flush=True); return

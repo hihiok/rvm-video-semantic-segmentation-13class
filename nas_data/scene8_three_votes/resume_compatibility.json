@@ -1,0 +1,25 @@
+{
+  "legacy_commit": "0701108c148583c7e800666b205b41fa717394a6",
+  "reason": "JSON tuple/list comparison and exact-policy preview resume only; inference, prompt, votes, models unchanged",
+  "legacy_code_hashes": {
+    "common.py": "747f7350de8935f789e6493464af54e5d59a86f395bed226621228b28dabc566",
+    "merge.py": "eebeba63ade1c5a2d1ed74f33578ca5ab30edde9b342f9150728a7903cda2bbb",
+    "mobile.py": "797d71ee7fdfbb74fb6e017eea132c8c5feba0602910735b3134fe688e164856",
+    "qwen.py": "37c27186deb827ddeb3bb283bc0bfc42bdd6e477d6424804ac3c2badea6e950d",
+    "prepare.py": "dceafad35bc853ce180e0dbefc1b5d3bd7bdefc8aa248596ccf0658eb124cf9f",
+    "prompts.py": "99b3810e8c698fff5c9ec03cd0e1daead8326b5209245407430bc8cb6653cb94",
+    "legacy_prompts.py": "5fb0e37421a88304bcb2a07392c598d56fbf521a780c30299804eb16c047b30e",
+    "test_votes.py": "d30edad57784a4ad363a528d8b5de0950df1e26fc54673f1cfacd3e609b53a78"
+  },
+  "fixed_code_hashes": {
+    "common.py": "64b227680037b14a1bc4e185cf0f8016de2218d33b32ab7c05fd3575a40d5b7b",
+    "legacy_prompts.py": "5fb0e37421a88304bcb2a07392c598d56fbf521a780c30299804eb16c047b30e",
+    "merge.py": "bbe78c5dd8594c67bf722075659a40b55fea2bde7d7e182a18abee71fe97744e",
+    "mobile.py": "797d71ee7fdfbb74fb6e017eea132c8c5feba0602910735b3134fe688e164856",
+    "prepare.py": "dceafad35bc853ce180e0dbefc1b5d3bd7bdefc8aa248596ccf0658eb124cf9f",
+    "prompts.py": "99b3810e8c698fff5c9ec03cd0e1daead8326b5209245407430bc8cb6653cb94",
+    "qwen.py": "37c27186deb827ddeb3bb283bc0bfc42bdd6e477d6424804ac3c2badea6e950d",
+    "test_resume.py": "8de2ab942ce8fca3a80242e5a5099cd93bef32b1f8bc1e6346aa2c9442334b52",
+    "test_votes.py": "d30edad57784a4ad363a528d8b5de0950df1e26fc54673f1cfacd3e609b53a78"
+  }
+}

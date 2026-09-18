@@ -94,16 +94,44 @@ class RecordStore:
             self.lock.close()
 
 
+def json_value(obj):
+    """Use the persisted JSON value domain: tuples and lists serialize identically."""
+    return json.loads(json.dumps(obj, ensure_ascii=False, allow_nan=False))
+
+
+def current_code_hashes():
+    return {p.name: sha(p) for p in sorted(Path(__file__).parent.glob('*.py'))}
+
+
+def approved_legacy_resume(saved_code, current_code=None):
+    """Allow ONLY the reviewed 0701108 -> JSON-resume fix transition."""
+    profile = read(Path(__file__).with_name('resume_compatibility.json'))
+    return (saved_code == profile['legacy_code_hashes'] and
+            (current_code if current_code is not None else current_code_hashes()) == profile['fixed_code_hashes'])
+
+
 def stage_lock(root, name, meta):
-    code = {p.name: sha(p) for p in sorted(Path(__file__).parent.glob('*.py'))}
-    meta = dict(meta, code_hashes=code)
+    code = current_code_hashes()
+    meta = json_value(dict(meta, code_hashes=code))
     d = root / name
     d.mkdir(exist_ok=True)
     p = d / 'metadata.json'
-    if p.exists() and read(p) != meta:
+    if p.exists():
+        saved = read(p)
+        if saved == meta:
+            return d, digest(saved)
+        old_semantics = {k: v for k, v in saved.items() if k != 'code_hashes'}
+        new_semantics = {k: v for k, v in meta.items() if k != 'code_hashes'}
+        if old_semantics == new_semantics and approved_legacy_resume(saved.get('code_hashes'), code):
+            # Preserve metadata and existing SQLite row digests byte-for-byte.
+            # Only identity comparison / resume bookkeeping changed; inference is identical.
+            audit = {'reason': '0701108_json_tuple_list_resume_fix',
+                     'legacy_metadata_sha256': sha(p), 'retained_run_digest': digest(saved),
+                     'executing_code_hashes': code, 'metadata_and_existing_rows_rewritten': False}
+            dump(d / 'resume_compatibility_audit.json', audit)
+            return d, digest(saved)
         raise ValueError('Resume refused: model, code, prompts or selection changed. Use a new output directory.')
-    if not p.exists():
-        dump(p, meta)
+    dump(p, meta)
     return d, digest(meta)
 
 
